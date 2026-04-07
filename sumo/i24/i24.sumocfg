@@ -18,7 +18,12 @@
     </output> -->
 
     <time>
-        <step-length value="0.5"/>
+        <begin value="0"/>
+        <end value="3600"/>
+        <step-length value="0.1"/>
     </time>
+	<gui_only>
+		<start value="t"/>
+	</gui_only>
 
 </configuration>

@@ -1,0 +1,12 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!-- ground truth parameters -->
+<routes>
+	<vType id="gt" length="4.3" carFollowModel="IDM" emergencyDecel="4.0" laneChangeModel="SL2015" latAlignment="arbitrary" lcKeepRight="0.0" lcOvertakeRight="0.0" maxSpeed="30.55" minGap="2.5" accel="1.0" decel="2" tau="1.4" lcSublane="1.0" maxSpeedLat="5" lcAccelLat="1.2" minGapLat="0.4" lcStrategic="50" lcCooperative="1.0" lcPushy="0.4" lcImpatience="0.9" lcSpeedGain="1.5" />
+
+    <route id="ramp" edges="ramp E2 E4" />
+	<route id="mainlane" edges="E0 E1 E2 E4 " />
+	
+    <flow id="ramp_0_low" type="gt" begin="0" end="480" vehsPerHour="500" route="ramp" departLane="random" departSpeed="desired" />
+    <flow id="ramp_0_med" type="gt" begin="480" end="960" vehsPerHour="1000" route="ramp" departLane="random" departSpeed="desired" />
+    <flow id="ramp_0_high" type="gt" begin="960" end="1440" vehsPerHour="2000" route="ramp" departLane="random" departSpeed="desired" />
+</routes>
