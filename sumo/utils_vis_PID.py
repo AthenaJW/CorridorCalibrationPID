@@ -706,19 +706,20 @@ def scipy_impute(df):
     result_df = pd.DataFrame(imputed_values, index=df.index, columns=df.columns)
     return result_df.bfill(axis=1).ffill(axis=1).bfill(axis=0).ffill(axis=0)
 
-def calculate_mape(sim_df, pid_df):
-    # Ensure they have the same shape and labels
-        sim_df, pid_df = pid_df.align(sim_df, join='inner')
-        
-        # Use Pandas operations directly (simpler, handles indices for you)
-        # This avoids the np.full and manual masking headache
-        abs_pct_error = (sim_df - pid_df).abs() / sim_df
-        
-        # Replace infinite values (where pid was 0) and NaNs
-        abs_pct_error = abs_pct_error.replace([np.inf, -np.inf], np.nan)
-        
-        # Calculate the mean of all non-NaN values
-        return abs_pct_error.mean().mean() * 100
+def calculate_mape(sim_df, pid_df, eps=1.0):
+    # 1. Align - ensure sim is the base
+    sim_df, pid_df = sim_df.align(pid_df, join='inner')
+    
+    # 2. Mask
+    mask = sim_df.notna() & pid_df.notna()
+    s = sim_df.values[mask]
+    p = pid_df.values[mask]
+    
+    # 3. Calculation - Only use 's' in the denominator!
+    # If your current code has (s + p + eps), change it to this:
+    abs_pct_error = np.abs(s - p) / (s + eps)
+    
+    return np.mean(abs_pct_error) * 100
 
 def calculate_smape(sim_df, pid_df):
     # Align and mask
