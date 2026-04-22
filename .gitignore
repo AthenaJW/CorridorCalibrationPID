@@ -14,4 +14,22 @@ config.json
 **/_log/
 **/figures/
 **/fcd_output/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.python-version
+venv/
+.env
+
+.DS_Store
+Thumbs.db
+*tripinfo*.xml
+*.dat
+sumo/i24/tripinfo_gt.xml
+sumo/i24b/tripinfo_gt.xml
+
+.vscode/
+.idea/
+pyproject.toml
 
