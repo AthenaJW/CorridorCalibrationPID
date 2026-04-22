@@ -3,6 +3,7 @@ import csv
 import subprocess
 import os
 import os
+from xml.dom import minidom
 import xml.etree.ElementTree as ET
 import numpy as np
 import sys
@@ -121,6 +122,73 @@ def run_sumo(sim_config, tripinfo_output=None, fcd_output=None):
         
     subprocess.run(command, check=True)
 
+def run_sumo_flowrouter(sim_config, tripinfo_output=None, fcd_output=None, det_interval=30,
+                        sensing_detectors=None, tracking_log = "fr_log.csv"):
+    """
+    Runs the pre-generated Flow Router simulation while logging 
+    sensor data at fixed intervals to match the PID logic.
+    """
+    # 1. Build the command
+    command = [SUMO_EXE, '-c', sim_config, 
+               '--no-step-log', '--xml-validation', 'never', 
+               '--lateral-resolution', '0.5']
+    
+    if tripinfo_output:
+        command.extend(['--tripinfo-output', tripinfo_output])
+    if fcd_output:
+        command.extend(['--fcd-output', fcd_output])
+
+    # 2. Start SUMO via TraCI
+    traci.start(command)
+    
+    # Setup Logging (matching your PID CSV format)
+    # This ensures your "Baseline" data looks exactly like your "PID" data
+    f_log = open(tracking_log, 'w', newline='')
+    writer = csv.writer(f_log)
+    writer.writerow(["step", "time", "sensors", "target", "observed", "speed"])
+
+    step = 0
+    end_time = num_timesteps # Set your desired simulation end time in seconds
+    
+    try:
+        while traci.simulation.getMinExpectedNumber() > 0:
+            traci.simulationStep()
+            time = traci.simulation.getTime()
+            
+            # 3. Check if we reached the measurement interval
+            if time % detector_interval == float(detector_interval - 1):
+                for i, det_tuple in enumerate(sensing_detectors):
+                    
+                    # SUM the vehicle counts from every lane in the tuple
+                    # This gives you the total flow for that cross-section
+                    cumulative = sum(
+                        traci.inductionloop.getLastIntervalVehicleNumber(d_id) 
+                        for d_id in det_tuple
+                    )
+                    observed_flows = (cumulative / detector_interval) * 3600
+
+                    
+                    # Calculate target_flow from your synth_data to keep the CSV consistent
+                    # Assuming target_idx aligns with your 30s buckets
+                    target_idx = int(time // det_interval) - 1
+                    
+                    # We use the same lookup logic as your PID script
+                    current_target = sum(
+                        synth_data["volume"][measurement_locations.index(d)][target_idx]
+                        for d in det_tuple
+                    )
+
+                    # Log the results
+                    writer.writerow([step, time, str(det_tuple), current_target, observed_flows])
+            
+            step += 1
+            if time > end_time:
+                break
+                
+    finally:
+        traci.close()
+        f_log.close()
+
 def run_PID_closed_loop_sumo(sim_config, controlled_flow_routes, sensing_detectors, 
                              debug_detectors, pid_controllers_feedback, pid_controllers_rectifier, synth_data, 
                              measurement_locations, detector_interval, num_timesteps, 
@@ -156,7 +224,7 @@ def run_PID_closed_loop_sumo(sim_config, controlled_flow_routes, sensing_detecto
         ma_steps = max(1, int(ma_windows[i] // detector_interval))
         sensing_history_buffers.append(deque(maxlen=ma_steps))
 
-    pid_sensor_log = "pid_log.csv"
+    pid_sensor_log = "pid_log_sim_3hr.csv"
     header_pid = ['step', 'time', 'sensors', 'target', 'observed', 'smoothed_error', 'raw_control_signal', 'delayed_signal', 'new_total_injection']
     header_tracking = ['step', 'time', 'sensor_id', 'total_count'] + [f'route_{i}_prop' for i in range(len(controlled_flow_routes))]
     header_debug = ['step', 'time', 'sensors', 'target', 'observed']
@@ -266,18 +334,17 @@ def run_PID_closed_loop_sumo(sim_config, controlled_flow_routes, sensing_detecto
                 # --- PART B: MEASURE FLOW ---
                 if time % detector_interval == float(detector_interval - 1):
                     target_idx = int(time // detector_interval) + 1
-                    route_proportions = cmd_probs
-                    # route_proportions = [1] * len(routes)
-                    # try:
-                    #     #route_proportions[1] = pid_flows['r_1'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx] +pid_flows['r_3'][target_idx])
-                    #     route_proportions[2] = pid_flows['r_2'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx] +pid_flows['r_3'][target_idx])
-                    #     route_proportions[3] = pid_flows['r_3'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx] +pid_flows['r_3'][target_idx])
-                    #     #route_proportions[4] = pid_flows['r_4'][target_idx] / (pid_flows['r_3'][target_idx] +pid_flows['r_4'][target_idx])
-                    # except:
-                    #     #route_proportions[1] = 0.33
-                    #     route_proportions[2] = 0.33
-                    #     route_proportions[3] = 0.33
-                    #     #route_proportions[4] = 0.7
+                    route_proportions = [1] * len(routes)
+                    try:
+                        route_proportions[1] = pid_flows['r_1'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx])
+                        route_proportions[2] = pid_flows['r_2'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx])
+                        route_proportions[3] = pid_flows['r_3'][target_idx] / (pid_flows['r_3'][target_idx] + pid_flows['r_4'][target_idx])
+                        route_proportions[4] = pid_flows['r_4'][target_idx] / (pid_flows['r_3'][target_idx] +pid_flows['r_4'][target_idx])
+                    except:
+                        route_proportions[1] = 0.5
+                        route_proportions[2] = 0.5
+                        route_proportions[3] = 0.5  
+                        route_proportions[4] = 0.5
 
                     ###### COMMENT OUT IF NOT DOING ROUTE ABLATION STUDY ######
                     # route_proportions[2] = 0.5
@@ -299,18 +366,17 @@ def run_PID_closed_loop_sumo(sim_config, controlled_flow_routes, sensing_detecto
                 # --- PART C: PID UPDATE & ROUTE-SPECIFIC DELAY ---
                 if time % detector_interval == 0 and time > 0:
                     target_idx = int(time // detector_interval)
-                    route_proportions = cmd_probs
-                    # try:
-                    #     #route_proportions[1] = pid_flows['r_1'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx] +pid_flows['r_3'][target_idx])
-                    #     route_proportions[2] = pid_flows['r_2'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx] +pid_flows['r_3'][target_idx])
-                    #     route_proportions[3] = pid_flows['r_3'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx] +pid_flows['r_3'][target_idx])
-                    #    #route_proportions[4] = pid_flows['r_4'][target_idx] / (pid_flows['r_3'][target_idx] +pid_flows['r_4'][target_idx])
-                    # except:
-                    #     #route_proportions[1] = 0.33
-                    #     route_proportions[2] = 0.33
-                    #     route_proportions[3] = 0.33
-                        
-                    #     #route_proportions[4] = 0.7
+                    route_proportions = [1] * len(routes)
+                    try:
+                        route_proportions[1] = pid_flows['r_1'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx])
+                        route_proportions[2] = pid_flows['r_2'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx])
+                        route_proportions[3] = pid_flows['r_3'][target_idx] / (pid_flows['r_3'][target_idx] + pid_flows['r_4'][target_idx])
+                        route_proportions[4] = pid_flows['r_4'][target_idx] / (pid_flows['r_3'][target_idx] +pid_flows['r_4'][target_idx])
+                    except:
+                        route_proportions[1] = 0.5
+                        route_proportions[2] = 0.5
+                        route_proportions[3] = 0.5  
+                        route_proportions[4] = 0.5
                     
                     ###### COMMENT OUT IF NOT DOING ROUTE ABLATION STUDY ######
                     # route_proportions[2] = 0.5
@@ -824,36 +890,268 @@ def save_sim_to_rds_csv(detector_data, measurement_locations, output_filename="s
     print(f"Fixed 24h file saved. Total intervals: {intervals}")
     print(f"Time range: {df_out['timestamp'].iloc[0]} to {df_out['timestamp'].iloc[-1]}")
 
-def read_rou_to_df(xml_path):
-    # Parse the XML file
-    tree = ET.parse(xml_path)
+
+def save_sim_to_rds_fr(detector_data, measurement_locations, output_filename="fr_intermediate.csv", interval_seconds=30):
+    """
+    Converts detector_data dict into the specific CSV format required by od_estimation.
+    """
+
+    # Calculate fixed number of intervals for 24 hours
+    # 24 hours * 3600 seconds / interval_seconds
+    intervals = int(num_timesteps / interval_seconds) 
+    
+    num_detectors = detector_data['speed'].shape[0]
+    actual_intervals = detector_data['speed'].shape[1]
+    
+    all_rows = []
+
+    for t in range(intervals):
+        
+        for i in range(num_detectors):
+            det_id = measurement_locations[i]
+            
+            
+            # Use actual data if available, otherwise default to 0
+            if t < actual_intervals:
+                spd = detector_data["speed"][i, t]
+                vol = detector_data["volume"][i, t]
+                occ = detector_data["occupancy"][i, t]
+            else:
+                spd, vol, occ = 0.0, 0.0, 0.0 # Default padding
+            
+            all_rows.append({
+                "Detector": det_id,
+                "Time": t*0.5,
+                "vPKW": spd,
+                "qPKW": (vol / 60) * 0.5,
+            })
+
+    df_out = pd.DataFrame(all_rows)
+    cwd = os.getcwd()
+        
+    df_out.to_csv(output_filename, sep = ";", index=False)
+
+    sumo_home = os.environ.get('SUMO_HOME')
+    if not sumo_home:
+        print("Error: SUMO_HOME environment variable is not set.")
+        return
+
+    # 2. Construct the path to flowrouter.py
+    # Using os.path.join ensures it works on both Windows and Linux
+    script_path = os.path.join(sumo_home, 'tools', 'detector', 'flowrouter.py')
+    
+    # 3. Define the command arguments
+    # Note: Ensure these files exist in your current working directory
+    command = [
+        sys.executable, script_path,
+        '-n', 'i24.net.xml',
+        '-d', 'I24_RDS_gt.add.xml',
+        '-f', 'fr_intermediate.csv',
+        '-o', 'routes.xml',
+        '-e', 'flows.xml',
+        '-i', '5'
+    ]
+
+    try:
+        print(f"Running: {' '.join(command)}")
+        # 4. Execute the command
+        result = subprocess.run(
+            command, 
+            check=True,          # Raises CalledProcessError if the command fails
+            capture_output=True, # Captures stdout and stderr
+            text=True            # Returns output as string instead of bytes
+        )
+        
+        print("Flowrouter completed successfully!")
+        print("Output:", result.stdout)
+
+    except subprocess.CalledProcessError as e:
+        print("Error during flowrouter execution:")
+        print(e.stderr)
+    
+    tree = ET.parse("routes.xml")
     root = tree.getroot()
+
+    # Parse the flows file
+    flow_tree = ET.parse("flows.xml")
+    flow_root = flow_tree.getroot()
+
+    vtype_str = """
+    <vType id="hdv" length="4.3" carFollowModel="IDM" emergencyDecel="4.0" 
+        laneChangeModel="SL2015" latAlignment="arbitrary" lcKeepRight="0.0" 
+        lcOvertakeRight="0.0" maxSpeed="30.55" minGap="2.5" accel="1.5" 
+        decel="2" tau="1.4" lcSublane="1.0" maxSpeedLat="1.4" 
+        lcAccelLat="0.7" minGapLat="0.4" lcStrategic="10.0" 
+        lcCooperative="1.0" lcPushy="0.4" lcImpatience="0.9" lcSpeedGain="1.5">
+        <param key="has.fcd.device" value="true" />
+    </vType>
+    """
+
+    # 3. Convert string to an element and insert at the VERY TOP of the root
+    vtype_element = ET.fromstring(vtype_str)
+    root.insert(0, vtype_element)
+
+    # Append every flow/vehicle from the second file into the first
+    for element in flow_root:
+        root.append(element)
+
+    # Write the combined result
+    tree.write("i24_flowrouter.rou.xml", encoding="UTF-8", xml_declaration=True)
+    print(f"Success! Created i24_flowrouter.rou.xml")
+    print(f"Fixed 24h file saved. Total intervals: {intervals}")
+    print(f"Time range: {df_out['Time'].iloc[0]} to {df_out['Time'].iloc[-1]}")
+
+
+def generate_fcd(csv_file, fcd_file="fcd_output/rds_fcd.xml"):
+    csv_data = pd.read_csv(csv_file, delimiter=';')
+
+    csv_data['Time'] = csv_data['Time'] * 60
     
-    # Extract attributes from every <flow> tag
-    flow_dicts = [flow.attrib for flow in root.findall('flow')]
+    # 2. Normalize to start at 0
+    start_time = csv_data['Time'].min()
+    csv_data['Time'] = csv_data['Time'] - start_time
+
+    print(csv_data.head())
+
     
-    # Create the DataFrame
-    df = pd.DataFrame(flow_dicts)
-    
-    # 1. Convert numeric columns from strings to floats/ints
-    numeric_cols = ['begin', 'end', 'vehsPerHour']
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col])
+    # detector to lane mapping based on SUMO configuration
+    detector_mapping = {
+        # 56.7 RDS: 5 lanes
+        "56_7_0": ("E1_5", "20"),
+        "56_7_1": ("E1_4", "20"),
+        "56_7_2": ("E1_3", "20"),
+        "56_7_3": ("E1_2", "20"),
+        "56_7_4": ("E1_1", "20"),
+
+        # 56.3 RDS: 5 lanes
+        "56_3_0": ("E3_4", "846"),
+        "56_3_1": ("E3_3", "846"),
+        "56_3_2": ("E3_2", "846"),
+        "56_3_3": ("E3_1", "846"),
+        "56_3_4": ("E3_0", "846"),
+
+        # 56.0 RDS: 5 lanes
+        "56_0_0": ("E3_4", "1329"),
+        "56_0_1": ("E3_3", "1329"),
+        "56_0_2": ("E3_2", "1329"),
+        "56_0_3": ("E3_1", "1329"),
+        "56_0_4": ("E3_0", "1329"),
+
+        # 55.3 RDS: 4 lanes
+        "55_3_0": ("E8_3", "130"),
+        "55_3_1": ("E8_2", "130"),
+        "55_3_2": ("E8_1", "130"),
+        "55_3_3": ("E8_0", "130"),
+
+        # 54.6 RDS: 4 lanes
+        "54_6_0": ("E8_3", "1080"),
+        "54_6_1": ("E8_2", "1080"),
+        "54_6_2": ("E8_1", "1080"),
+        "54_6_3": ("E8_0", "1080"),
+    }
+    # Create the root element
+    root = ET.Element("fcd-export")
+
+    # Group by Time (Timesteps)
+    for time, group in csv_data.groupby('Time'):
+        timestep = ET.SubElement(root, "timestep", time=str(time))
+        
+        for _, row in group.iterrows():
+            # Normalize ID: Change '54.6_0' to '54_6_0' to match the dictionary
+            csv_id = str(row['Detector']).replace(".", "_")
             
-    # 2. Handle the Negative Flow issue (like your f_3: -120.0)
-    # SUMO cannot process negative vehsPerHour. 
-    # It's better to zero them out here so your other functions don't crash.
-    df['vehsPerHour'] = df['vehsPerHour'].clip(lower=0)
+            if csv_id in detector_mapping:
+                lane_id, position = detector_mapping[csv_id]
+                speed_ms = round(row['vPKW'] / 3.6, 2)
+                
+                if speed_ms > 0:
+                    ET.SubElement(timestep, "vehicle", {
+                        "id": str(row['Detector']), # Keep original ID for the car
+                        "lane": lane_id,
+                        "speed": str(speed_ms),
+                        "pos": position,  # Now uses the real pos from your XML (e.g., 1080)
+                        "type": "PKW"
+                    })
+
+    # Save and Prettify
+    xml_str = minidom.parseString(ET.tostring(root)).toprettyxml(indent="   ")
+    with open(fcd_file, "w") as f:
+        f.write(xml_str)
+
+def run_sumo_od_estimation(sim_config,measured_data,tripinfo_output,
+            fcd_output,det_interval,sensing_detectors,tracking_log):
+    save_sim_to_rds_csv(measured_data, measurement_locations, output_filename="simulated_rds_data.csv")
+    _ = od_estimation('simulated_rds_data.csv', plot=True, write_rou_xml=True)
+
+    command = [SUMO_EXE, '-c', sim_config, 
+               '--no-step-log', '--xml-validation', 'never', 
+               '--lateral-resolution', '0.5']
+    
+    if tripinfo_output:
+        command.extend(['--tripinfo-output', tripinfo_output])
+    if fcd_output:
+        command.extend(['--fcd-output', fcd_output])
+
+    # 2. Start SUMO via TraCI
+    traci.start(command)
+    
+    # Setup Logging (matching your PID CSV format)
+    # This ensures your "Baseline" data looks exactly like your "PID" data
+    f_log = open(tracking_log, 'w', newline='')
+    writer = csv.writer(f_log)
+    writer.writerow(["step", "time", "sensors", "target", "observed", "speed"])
+
+    step = 0
+    end_time = num_timesteps # Set your desired simulation end time in seconds
+    
+    try:
+        while traci.simulation.getMinExpectedNumber() > 0:
+            traci.simulationStep()
+            time = traci.simulation.getTime()
             
-    return df
+            # 3. Check if we reached the measurement interval
+            if time % detector_interval == float(detector_interval - 1):
+                for i, det_tuple in enumerate(sensing_detectors):
+                    
+                    # SUM the vehicle counts from every lane in the tuple
+                    # This gives you the total flow for that cross-section
+                    cumulative = sum(
+                        traci.inductionloop.getLastIntervalVehicleNumber(d_id) 
+                        for d_id in det_tuple
+                    )
+                    observed_flows = (cumulative / detector_interval) * 3600
+
+                    
+                    # Calculate target_flow from your synth_data to keep the CSV consistent
+                    # Assuming target_idx aligns with your 30s buckets
+                    target_idx = int(time // det_interval) - 1
+                    
+                    # We use the same lookup logic as your PID script
+                    current_target = sum(
+                        synth_data["volume"][measurement_locations.index(d)][target_idx]
+                        for d in det_tuple
+                    )
+
+                    # Log the results
+                    writer.writerow([step, time, str(det_tuple), current_target, observed_flows])
+            
+            step += 1
+            if time > end_time:
+                break
+                
+    finally:
+        traci.close()
+        f_log.close()
+
 
 if __name__ == "__main__":
     cmd_probs = [float(x) for x in sys.argv[1:]] if len(sys.argv) > 1 else None
     ## SCRIPT CONFIGS ##
     RERUN_GT = False # whether to rerun the ground truth simulation and regenerate synthetic measurements (set to False to save time if already done)
     REAL_DATA = False
-    rds_file = "mediumnet_0300-0480.csv" # only used if REAL_DATA = True
+    method = "OD_ESTIMATION" # or "FLOWROUTER" "OD_ESTIMATION"
+
+    rds_file = "rds_file/mediumnet_0300-0480.csv" # only used if REAL_DATA = True
     # ================ Configure the logging module ====================
     current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     log_dir = '_log'
@@ -868,14 +1166,18 @@ if __name__ == "__main__":
     # ================================= run ground truth and generate synthetic measurements
     if REAL_DATA:
         measured_output = reader.extract_rds_measurements(rds_file, measurement_locations)
+        if method == "FLOWROUTER":
+            save_sim_to_rds_fr(measured_output, measurement_locations, output_filename="fr_intermediate.csv", interval_seconds=30)
         save_sim_to_rds_csv(measured_output, measurement_locations, output_filename="simulated_rds_data.csv")
-
+        generate_fcd(rds_file)
         pid_flows = od_estimation('simulated_rds_data.csv', plot=True, write_rou_xml=True)
     else:
         if RERUN_GT:
             run_sumo(SCENARIO+'_gt.sumocfg', tripinfo_output="tripinfo_gt.xml", fcd_output="fcd_output/fcd_sim.xml")
         measured_output = reader.extract_sim_meas(measurement_locations)
         save_sim_to_rds_csv(measured_output, measurement_locations, output_filename="simulated_rds_data.csv")
+        if method == "FLOWROUTER":
+            save_sim_to_rds_fr(measured_output, measurement_locations, output_filename="fr_intermediate.csv", interval_seconds=30)
         pid_flows = od_estimation('simulated_rds_data.csv', plot=True, write_rou_xml=True)
 
     # ================================= run PID closed-loop calibration with synthetic measurements
@@ -896,7 +1198,7 @@ if __name__ == "__main__":
                         ]
     sensing_detectors = [('56_7_0', '56_7_1', '56_7_2', '56_7_3'),
                          ("56_3_4",),
-                         ("56_7_4",),
+                         ("56_3_4",),
                          ("56_7_4",),
                          ("55_3_3",)]
     
@@ -905,49 +1207,56 @@ if __name__ == "__main__":
     pid_controllers_rectifier = [PID(0.8, 0.0, 0.0, setpoint=0.0), 
                        PID(0.2, 0, 0, setpoint=0.0),
                        PID(0.2, 0, 0, setpoint=0.0),
-                       PID(0.2, 0, 0, setpoint=0.0),
-                       PID(0.1, 0.0, 0, setpoint=0.0)]
+                       PID(0.4, 0, 0, setpoint=0.0),
+                       PID(0.4, 0.0, 0, setpoint=0.0)]
     
     pid_controllers_feedback = [PID(1.2, 0, 0.0, setpoint=0.0), 
                        PID(1.2, 0, 0, setpoint=0.0),
                        PID(1.2, 0, 0, setpoint=0.0),
                        PID(1.2, 0, 0, setpoint=0.0),
-                       PID(1.2, 0.0, 0, setpoint=0.0)]
-
-    # speed_pids = [] // backpressure detectors deprecated
-    # for i, det_tuple in enumerate(backpressure_detectors):
-    #     if det_tuple[0] != '':
-    #         # Target Speed: 13.89 m/s (~50 km/h) 
-    #         # Output: A 'Max Flow' value (veh/h)
-    #         pid_speed = PID(Kp=100, Ki=10, Kd=2, setpoint=13.89)
-    #         pid_speed.output_limits = (0, 2200 * num_lanes[i])
-    #         speed_pids.append(pid_speed)
-    #     else:
-    #         speed_pids.append(None)
+                       PID(1.2, 0.0, 0, setpoint=0.0)] # need for ablation study
 
     delays = probe_simulation_transfer_delays(SCENARIO+".sumocfg", controlled_flows_route, sensing_detectors, SUMO_EXE)
     no_delays = [1, 1, 1, 1, 1] # for ablation version with no delay
     #delays = [0] * len(controlled_flows_route)
     ## to do: add a configuration checking function here
-    run_PID_closed_loop_sumo(
-        sim_config=SCENARIO + ".sumocfg", 
-        controlled_flow_routes=controlled_flows_route, 
-        sensing_detectors=sensing_detectors, 
-        debug_detectors=debug_detectors, 
-        pid_controllers_feedback=pid_controllers_feedback, 
-        pid_controllers_rectifier=pid_controllers_rectifier,
-        synth_data=synth_data, 
-        fcd_output="fcd_output/fcd_pid.xml",
-        # --- New Parameters Added Below ---
-        measurement_locations=measurement_locations, # List of detector IDs mapping synth_data
-        detector_interval=detector_interval,         # e.g., 60 (seconds)
-        num_timesteps=num_timesteps,                 # Total simulation duration
-        step_length=step_length,                     # e.g., 1.0 or 0.5
-        SUMO_EXE=SUMO_EXE,                           # Path to sumo or sumo-gui executable
-        transfer_delays=no_delays,                          # The delay in seconds (adjust as needed)
-        ma_windows= [30, 30, 30, 30, 30],             # Moving average window in seconds (adjust as needed)
-        num_lanes = num_lanes,
-        route_tracking_sensors=measurement_locations,
-        routes=['r_0', 'r_1', 'r_2', 'r_3', 'r_4'],
-        pid_flows=pid_flows,
-        cmd_probs = cmd_probs)
+
+    if method == "PID":
+        run_PID_closed_loop_sumo(
+            sim_config=SCENARIO + ".sumocfg", 
+            controlled_flow_routes=controlled_flows_route, 
+            sensing_detectors=sensing_detectors, 
+            debug_detectors=debug_detectors, 
+            pid_controllers_feedback=pid_controllers_feedback, 
+            pid_controllers_rectifier=pid_controllers_rectifier,
+            synth_data=synth_data, 
+            fcd_output="fcd_output/fcd_pid_sim_3hr.xml",
+            # --- New Parameters Added Below ---
+            measurement_locations=measurement_locations, # List of detector IDs mapping synth_data
+            detector_interval=detector_interval,         # e.g., 60 (seconds)
+            num_timesteps=num_timesteps,                 # Total simulation duration
+            step_length=step_length,                     # e.g., 1.0 or 0.5
+            SUMO_EXE=SUMO_EXE,                           # Path to sumo or sumo-gui executable
+            transfer_delays=no_delays,                          # The delay in seconds (adjust as needed)
+            ma_windows= [30, 30, 30, 30, 30],             # Moving average window in seconds (adjust as needed)
+            num_lanes = num_lanes,
+            route_tracking_sensors=measurement_locations,
+            routes=['r_0', 'r_1', 'r_2', 'r_3', 'r_4'],
+            pid_flows=pid_flows)
+    elif method == "FLOWROUTER":
+        run_sumo_flowrouter(SCENARIO + "_fr.sumocfg", 
+            tripinfo_output=None, 
+            fcd_output="fcd_output/fcd_fr_sim_3hr.xml", 
+            det_interval=30,
+            sensing_detectors=sensing_detectors, 
+            tracking_log = "fr_log.csv")
+    elif method == "OD_ESTIMATION":
+        run_sumo_od_estimation(
+            sim_config = SCENARIO+"_od.sumocfg",
+            measured_data = synth_data,
+            tripinfo_output=None,
+            fcd_output="fcd_output/fcd_od_sim_3hr.xml",
+            det_interval=30,
+            sensing_detectors=sensing_detectors,
+            tracking_log="od_log.csv"
+        )

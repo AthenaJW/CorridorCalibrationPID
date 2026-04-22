@@ -12,3 +12,6 @@ unused/*
 config.json
 **/temp/
 **/_log/
+**/figures/
+**/fcd_output/
+

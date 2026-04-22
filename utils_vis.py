@@ -1326,44 +1326,79 @@ def od_estimation(rds_file, plot=False, write_rou_xml=False):
         f25 + f23 = y5
     This ssytem of equations have infinite solution - assume TR estimated at Harding off-ramp
     '''
-    START_RDS_HR = 4
-    END_RDS_HR = 10
-    FREQ = "30min" # FREQ X SCALE should be 1hr
-    SCALE = 2
-    source_file = r"C:\Users\yanbing.wang\Documents\CorridorCalibration\sumo\I24scenario\I24_scenario_old.rou.xml"
-    destination_file = r"C:\Users\yanbing.wang\Documents\CorridorCalibration\sumo\I24scenario\I24_scenario.rou.xml"
+    START_RDS_HR = 0
+    END_RDS_HR = 3
+    FREQ = "30s" # FREQ X SCALE should be 1hr
+    SCALE = 120
+    source_file = r"/Users/wanga/code/CorridorCalibrationPID/sumo/i24/I24_scenario_old.rou.xml"
+    destination_file = r"/Users/wanga/code/CorridorCalibrationPID/sumo/i24/I24_scenario.rou.xml"
     
     # get RDS data
     df = pd.read_csv(rds_file)
     df['timestamp'] = pd.to_datetime(df['timestamp'], format='%H:%M:%S')
 
     filtered_df = df[df['milemarker'].isin([57.3, 56.7, 56.3, 56.0, 55.3])] # include mainline and ramp flows
-    scale = 2 # convert to vehperhr
-    aggregated = filtered_df.groupby(
-            ['link_name', pd.Grouper(key='timestamp', freq=FREQ)]
-        ).agg({
-            'speed': 'mean',     # Average speed
-            'volume': 'sum',     # Sum of volume
-            'occupancy': 'mean'  # Average occupancy
-        }).reset_index()
+    #scale = 2 # convert to vehperhr
+    # STEP 1: Sum the lanes for every individual timestamp
+    # This turns "Lane Flow" into "Total Road Flow" for that specific 30-second moment
+    road_flow_at_instant = filtered_df.groupby(['timestamp', 'link_name']).agg({
+        'volume': 'sum',    # Sum across lanes (e.g., 1500+1500+1500+1500 = 6000)
+        'speed': 'mean',    # Average speed across lanes
+        'occupancy': 'mean'
+    }).reset_index()
+
+    # STEP 2: Average those road flows into your 15-minute buckets
+    # This smooths the flow rate over the FREQ window
+    aggregated = road_flow_at_instant.groupby(
+        ['link_name', pd.Grouper(key='timestamp', freq=FREQ)]
+    ).agg({
+        'volume': 'mean',   # Average the flow rates (e.g., average of 6000 vph over 15 mins)
+        'speed': 'mean',
+        'occupancy': 'mean'
+    }).reset_index()
     timestamps = aggregated[aggregated["link_name"] == ' R3G-00I24-56.0W (262)']["timestamp"]
-    y1 = aggregated[aggregated["link_name"] == ' R3G-00I24-56.0W Off Ramp (262)']["volume"].values * SCALE # convert to vph
-    y2 = aggregated[aggregated["link_name"] == ' R3G-00I24-56.0W (262)']["volume"].values * SCALE
-    y3 = aggregated[aggregated["link_name"] == ' R3G-00I24-55.3W (259)']["volume"].values * SCALE
-    y4 = aggregated[aggregated["link_name"] == ' R3G-00I24-56.7W (267)']["volume"].values * SCALE
-    y5 = aggregated[aggregated["link_name"] == ' R3G-00I24-56.7W On Ramp (267)']["volume"].values * SCALE
+    y1 = aggregated[aggregated["link_name"] == ' R3G-00I24-56.0W Off Ramp (262)']["volume"].values  # convert to vph
+    y2 = aggregated[aggregated["link_name"] == ' R3G-00I24-56.0W (262)']["volume"].values
+    y3 = aggregated[aggregated["link_name"] == ' R3G-00I24-55.3W (259)']["volume"].values
+    y4 = aggregated[aggregated["link_name"] == ' R3G-00I24-56.7W (267)']["volume"].values
+    y5 = aggregated[aggregated["link_name"] == ' R3G-00I24-56.7W On Ramp (267)']["volume"].values
     # print(timestamps)
 
     # solution - underdetermined (f13 and f23 are co-dependent)
     # with turning ratio assumption
-    TR = y1/(y1+y2)
+    #TR = y1/(y1+y2)
+    total_flow = y1 + y2
+    TR = np.where(total_flow > 0, y1 / total_flow, 0.0)
     # TR = 0.1038
     f13 = TR * y4
     f15 = (1-TR) * y4
     f45 = y3 - y2
     f25 = y3 - f15 - f45
     f23 = y1 - f13
+
+    data = {
+        'r_1': f13, 'r_0': f15, 'r_4': f45, 'r_3': f25, 'r_2': f23
+    }
     
+    df = pd.DataFrame(data)
+
+    # Step 1: Zero-clipping (No negative vehicles)
+    df = df.clip(lower=0)
+
+    # Step 2: Temporal Smoothing
+    # window=3 on 30s data = 1.5 minute smoothing
+    # This prevents the 'shock' of sudden volume changes
+    df_smoothed = df.rolling(window=10, min_periods=1, center=True).mean()
+
+    # Convert back to your dictionary of lists format
+    smoothed_dict = {route: df_smoothed[route].tolist() for route in df_smoothed.columns}
+    f15 = smoothed_dict['r_0']
+    f13 = smoothed_dict['r_1']
+    f23 = smoothed_dict['r_2']
+    f25 = smoothed_dict['r_3']
+    f45 = smoothed_dict['r_4']
+    print(f15, f13, f23, f25, f45)
+
     if plot:
         to_plot = [f13, f15, f25, f23, f45]
         labels =  ["f13", "f15", "f25", "f23", "f45"]
@@ -1384,7 +1419,7 @@ def od_estimation(rds_file, plot=False, write_rou_xml=False):
 
     if write_rou_xml is not False:
         # create a copy of "I24_scenario.rou.xml" in /I24scenario
-        shutil.copy(source_file, destination_file)
+        #shutil.copy(source_file, destination_file)
 
         # delete all flow
         rou_tree = ET.parse(destination_file)
@@ -1395,8 +1430,8 @@ def od_estimation(rds_file, plot=False, write_rou_xml=False):
 
         # modify flow according to f13 etc.
         # time indices - flows are from 0:00AM to 24:00, select 5-9AM
-        start = int(START_RDS_HR * scale)
-        end = int(END_RDS_HR * scale)
+        start = int(START_RDS_HR * SCALE)
+        end = int(END_RDS_HR * SCALE)
         idx = 0
         flows = [f15, f13, f23, f25, f45]
         routes = ["r_0", "r_1", "r_2", "r_3", "r_4"]
@@ -1405,11 +1440,11 @@ def od_estimation(rds_file, plot=False, write_rou_xml=False):
             for f, r in zip(flows, routes):
                 flow_elem = {
                     "id": f"f_{idx}",
-                    "type": "trial",
-                    "begin": f"{(i-start) * 1800}",
+                    "type": "hdv",
+                    "begin": f"{(i-start) * 30}",
                     "departLane": "best",
                     "route": r,
-                    "end": f"{(i-start+1) * 1800}",
+                    "end": f"{(i-start+1) * 30}",
                     "vehsPerHour": f"{f[i]}",
                     "departSpeed": "desired"
                 }
@@ -1429,16 +1464,257 @@ def od_estimation(rds_file, plot=False, write_rou_xml=False):
                 "vehsPerHour": flow["vehsPerHour"],
                 "departSpeed": flow["departSpeed"]
             })
+            
         # Convert the tree to a string
-        xml_str = ET.tostring(rou_root, encoding='utf-8', method='xml').decode('utf-8')
-        # Format the XML string with indentation
-        formatted_xml_str = minidom.parseString(xml_str).toprettyxml(indent="  ")
+        # xml_str = ET.tostring(rou_root, encoding='utf-8', method='xml').decode('utf-8')
+        # # Format the XML string with indentation
+        # formatted_xml_str = minidom.parseString(xml_str).toprettyxml(indent="  ")
         
-        # Write to file
-        with open(destination_file, "w") as f:
-            f.write(formatted_xml_str)
+        # # Write to file
+        # #rou_tree.write(destination_file, encoding="utf-8", xml_declaration=True)
+        # with open(destination_file, "w") as f:
+        #     print("writing to destination file: ", destination_file)
+        #     f.write(formatted_xml_str)
 
-    return
+
+        ET.indent(rou_root, space="  ")
+
+        # 3. Convert to string without minidom
+        xml_bytes = ET.tostring(rou_root, encoding='utf-8', xml_declaration=True)
+
+        with open(destination_file, "wb") as f: # Note 'wb' for bytes
+            f.write(xml_bytes)
+
+    return dict(zip(routes, flows))
+
+
+def od_estimation_large(rds_file, plot=False, write_rou_xml=False):
+    '''
+    An ad-hoc function to estimate routes for SUMO.rou.xml file in I-24 scenario
+    OD flow variables
+        <route id="r_0" edges="E0 E1 E3 E5 E7 E8" /> mainline f15
+        <route id="r_1" edges="E0 E1 E3 E4" />  f13
+        <route id="r_2" edges="E2 E1 E3 E4" />  f23
+        <route id="r_3" edges="E2 E1 E3 E5 E7 E8" />  f25
+        <route id="r_4" edges="E6 E7 E8" /> f45
+    RDS data
+        y1: MM56.0 off-ramp
+        y2: MM56.0 mainline
+        y3: MM55.3 mainline
+        y4: MM56.7 mainline
+        y5: MM56.7 on-ramp
+    system of equations (see map)
+        f13 + f23 = y1
+        f45 = y3 - y2
+        f15 + f25 + f45 = y3
+        f15 + f13 + f25 + f23 = y1+y2
+        f15 + f13 = y4
+        f25 + f23 = y5
+    This ssytem of equations have infinite solution - assume TR estimated at Harding off-ramp
+    '''
+    START_RDS_HR = 0
+    END_RDS_HR = 1
+    FREQ = "30s" # FREQ X SCALE should be 1hr
+    SCALE = 120
+    source_file = r"/Users/wanga/code/CorridorCalibrationPID/sumo/i24/I24_scenario_old.rou.xml"
+    destination_file = r"/Users/wanga/code/CorridorCalibrationPID/sumo/i24/I24_scenario.rou.xml"
+    
+    # get RDS data
+    df = pd.read_csv(rds_file)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], format='%H:%M:%S')
+
+    filtered_df = df[df['milemarker'].isin([56.5, 56.4, 56.0, 55.8, 55.6])] # include mainline and ramp flows
+    #scale = 2 # convert to vehperhr
+    # STEP 1: Sum the lanes for every individual timestamp
+    # This turns "Lane Flow" into "Total Road Flow" for that specific 30-second moment
+    road_flow_at_instant = filtered_df.groupby(['timestamp', 'link_name']).agg({
+        'volume': 'sum',    # Sum across lanes (e.g., 1500+1500+1500+1500 = 6000)
+        'speed': 'mean',    # Average speed across lanes
+        'occupancy': 'mean'
+    }).reset_index()
+
+    # STEP 2: Average those road flows into your 15-minute buckets
+    # This smooths the flow rate over the FREQ window
+    aggregated = road_flow_at_instant.groupby(
+        ['link_name', pd.Grouper(key='timestamp', freq=FREQ)]
+    ).agg({
+        'volume': 'mean',   # Average the flow rates (e.g., average of 6000 vph over 15 mins)
+        'speed': 'mean',
+        'occupancy': 'mean'
+    }).reset_index()
+    print(aggregated)
+    timestamps = aggregated[aggregated["link_name"] == '56_0']["timestamp"]
+    y1 = aggregated[aggregated["link_name"] == '56_0_off']["volume"].values  # convert to vph
+    y2 = aggregated[aggregated["link_name"] == '56_0']["volume"].values
+    y3 = aggregated[aggregated["link_name"] == '55_8']["volume"].values
+    y4 = aggregated[aggregated["link_name"] == '56_4']["volume"].values
+    y5 = aggregated[aggregated["link_name"] == '56_4_on']["volume"].values
+    # print(timestamps)
+    print(len(y1), len(y2), len(y3), len(y4), len(y5))
+
+    # solution - underdetermined (f13 and f23 are co-dependent)
+    # with turning ratio assumption
+    #TR = y1/(y1+y2)
+    total_flow = y1 + y2
+    TR = np.where(total_flow > 0, y1 / total_flow, 0.0)
+    # TR = 0.1038
+    r_1_a = TR * y4
+    r_0_a = (1-TR) * y4
+    r_4_a = y3 - y2
+    r_3_a = y3 - r_0_a - r_4_a
+    r_2_a = y1 - r_1_a
+
+    # data = {
+    #     'r_1': f13, 'r_0': f15, 'r_4': f45, 'r_3': f25, 'r_2': f23
+    # } - for reference
+    
+
+    # second detector setup
+    timestamps = aggregated[aggregated["link_name"] == '55_8']["timestamp"]
+    y6 = aggregated[aggregated["link_name"] == '55_8_ramp']["volume"].values  # convert to vph
+    y7 = aggregated[aggregated["link_name"] == '55_8']["volume"].values
+    y8 = aggregated[aggregated["link_name"] == '55_6']["volume"].values
+    y9 = aggregated[aggregated["link_name"] == '55_8']["volume"].values
+    y10 = aggregated[aggregated["link_name"] == '55_8_ramp']["volume"].values
+
+
+    # solution - underdetermined (f13 and f23 are co-dependent)
+    # with turning ratio assumption
+    #TR = y1/(y1+y2)
+    total_flow = y6 + y7
+    TR = np.where(total_flow > 0, y6 / total_flow, 0.0)
+    # TR = 0.1038
+    r_1_b = TR * y9
+    r_0_b = (1-TR) * y9
+    r_4_b = y8 - y7
+    r_3_b = y8 - r_0_b - r_4_b
+    r_2_b = y6 - r_1_b
+
+    A = np.zeros((10, 13))
+
+    # r_0_a = r25 + r21 (indices 12 and 10)
+    A[0, 12] = 1; A[0, 10] = 1
+    # r_1_a = r19 + r20 (indices 8 and 9)
+    A[1, 8] = 1; A[1, 9] = 1
+    # r_2_a = r11 + r12 (indices 5 and 6)
+    A[2, 5] = 1; A[2, 6] = 1
+    # r_3_a = r13 + r23 (indices 7 and 11)
+    A[3, 7] = 1; A[3, 11] = 1
+    # r_4_a = r3 + r4 + r9 + r10 (indices 1, 2, 3, 4)
+    A[4, 1] = 1; A[4, 2] = 1; A[4, 3] = 1; A[4, 4] = 1
+
+    # r_0_b = r23 + r25 (indices 11 and 12)
+    A[5, 11] = 1; A[5, 12] = 1
+    # r_1_b = r21 + r13 (indices 10 and 7)
+    A[6, 10] = 1; A[6, 7] = 1
+    # r_2_b = r3 + r4 (indices 1 and 2)
+    A[7, 1] = 1; A[7, 2] = 1
+    # r_3_b = r9 + r10 (indices 3 and 4)
+    A[8, 3] = 1; A[8, 4] = 1
+    # r_4_b = r1 (index 0)
+    A[9, 0] = 1
+
+    # 3. Define the B matrix (the results of your r_a and r_b calculations)
+    # Since your r values are arrays, B will be (10, num_timestamps)
+    B = np.array([r_0_a, r_1_a, r_2_a, r_3_a, r_4_a, r_0_b, r_1_b, r_2_b, r_3_b, r_4_b])
+
+    # 4. Solve the system
+    # Because it is underdetermined, we use Least Squares.
+    # np.linalg.lstsq returns several values; we just want the first (the solution)
+    x_sol, residuals, rank, s = np.linalg.lstsq(A, B, rcond=None)
+
+    # 5. Map results back to meaningful names
+    # x_sol[0] is r1 for all timestamps, x_sol[1] is r3, etc.
+    data = {
+        'r1': x_sol[0], 'r3': x_sol[1], 'r4': x_sol[2], 'r9': x_sol[3],
+        'r10': x_sol[4], 'r11': x_sol[5], 'r12': x_sol[6], 'r13': x_sol[7],
+        'r19': x_sol[8], 'r20': x_sol[9], 'r21': x_sol[10], 'r23': x_sol[11],
+        'r25': x_sol[12]
+    }
+    
+    
+    # Step 1: Zero-clipping & Smoothing
+    # Assuming 'data' is the dictionary containing r1, r3, r4... from the solver
+    df = pd.DataFrame(data)
+    df = df.clip(lower=0)
+    
+    # window=10 smoothing
+    df_smoothed = df.rolling(window=10, min_periods=1, center=True).mean()
+
+    # Create the smoothed_dict for the XML and return values
+    smoothed_dict = {route: df_smoothed[route].tolist() for route in df_smoothed.columns}
+
+    if plot:
+        plt.figure(figsize=(14, 7))
+        
+        # Loop through every column in the smoothed dataframe
+        # This automatically picks up r1, r3, r4, r9, r10, etc.
+        for route_name in df_smoothed.columns:
+            plt.plot(timestamps, df_smoothed[route_name], label=route_name, alpha=0.8)
+        
+        plt.xlabel('Time')
+        plt.ylabel("Volume (veh/hr)")
+        plt.title("I-24b Path Flows (Solved System)")
+        
+        # Date formatting
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        plt.xticks(rotation=45)    
+
+        # Place legend outside if it's too crowded with 13 lines
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2)
+        plt.tight_layout()
+        plt.show()
+
+    # Update your XML logic to use the new routes
+    routes = list(smoothed_dict.keys())
+    # ... rest of your XML and return logic
+
+    if write_rou_xml is not False:
+        # Load the existing tree
+        rou_tree = ET.parse(destination_file)
+        rou_root = rou_tree.getroot()
+        
+        # Clear existing flows
+        for flow in rou_root.findall(".//flow"):
+            rou_root.remove(flow)
+
+        # Time indices configuration
+        start = int(START_RDS_HR * SCALE)
+        end = int(END_RDS_HR * SCALE)
+        idx = 0
+        
+        # Logic: Iterate through the time steps, then through every route in our results
+        for i in np.arange(start, end):
+            # smoothed_dict contains: {'r1': [...], 'r3': [...], ...}
+            for r_name, f_series in smoothed_dict.items():
+                
+                # Get the volume for this specific route at this specific timestamp
+                veh_per_hour = f_series[i]
+                
+                # We skip writing flows that are exactly 0 to keep the XML file size down
+                if veh_per_hour > 0:
+                    ET.SubElement(rou_root, "flow", {
+                        "id": f"f_{r_name}_{idx}",
+                        "type": "hdv",
+                        "begin": f"{(i - start) * 30}",
+                        "departLane": "best",
+                        "route": r_name,
+                        "end": f"{(i - start + 1) * 30}",
+                        "vehsPerHour": f"{veh_per_hour:.2f}",
+                        "departSpeed": "desired"
+                    })
+                    idx += 1
+
+        # Pretty-print and save
+        ET.indent(rou_root, space="  ")
+        xml_bytes = ET.tostring(rou_root, encoding='utf-8', xml_declaration=True)
+
+        with open(destination_file, "wb") as f:
+            print(f"Writing {idx} flows to: {destination_file}")
+            f.write(xml_bytes)
+
+    # Final return using the full set of solved flows
+    return smoothed_dict
          
 
 
@@ -1449,5 +1725,5 @@ if __name__ == "__main__":
     # plot_time_space(r"C:\Users\yanbing.wang\Documents\CFCalibration\data", "DATA (NO MOTORCYCLES).txt", highlight_leaders=False)
 
     rds_file = r'data/RDS/I24_WB_52_60_11132023.csv'
-    vis_rds_lines(rds_file=rds_file, milemarkers=[57.3, 56.7, 6.3], quantity="volume") # [57.3, 56.7, 56.3, 56.0]
-    # od_estimation(rds_file, plot=True, write_rou_xml=True)
+    #vis_rds_lines(rds_file=rds_file, milemarkers=[57.3, 56.7, 6.3], quantity="volume") # [57.3, 56.7, 56.3, 56.0]
+    od_estimation(rds_file, plot=True, write_rou_xml=True)

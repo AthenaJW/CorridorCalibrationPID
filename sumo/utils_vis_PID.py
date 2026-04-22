@@ -15,15 +15,19 @@ import argparse
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import math
+import shutil
+from scipy.interpolate import griddata
 
-main_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')) # two levels up
+main_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../')) # two levels up
 sys.path.insert(0, main_path)
+
+from utils_data_read import rds_to_matrix_i24b
 
 # import utils_macro as macro
 # import utils_vis as vis
 
 # ================ on-ramp scenario setup ====================
-SCENARIO = "i24"
+SCENARIO = "i24b"
 EXP = "1b"
 N_TRIALS = 10000
 SUMO_DIR = os.path.dirname(os.path.abspath(__file__)) # current script directory
@@ -91,7 +95,8 @@ num_timesteps = config[SCENARIO]["SIMULATION_TIME"]
 step_length = config[SCENARIO]["STEP_LENGTH"]
 detector_interval = config[SCENARIO]["DETECTOR_INTERVAL"]
 SIM_TIME = num_timesteps * step_length  # total simulation time in seconds
-
+DETECTOR_FILE = config[SCENARIO]["DETECTOR_FILE"]
+METHOD_TYPE = config[SCENARIO]["METHOD_TYPE"]
 
 def parse_multiple_detector_files(lane_to_det, folder_path="onramp"):
     """
@@ -468,32 +473,72 @@ def get_lane_count_grid(net_file, mainline_edges, segment_length=100):
 
     return pd.Series(lane_counts_per_bin, name="num_lanes")
 
-def parse_fcd_to_timespace(fcd_xml, net_file, mainline_edges, sim_time, segment_length=100, time_step=10):
-    # 1. Automatically get offsets and total mainline length
+def parse_fcd_to_timespace(fcd_xml, net_file, mainline_edges, sim_time, segment_length=100, time_step=10, impute=False):
+   
+    # 1. Map the Mainline Backbone in order
     net = sumolib.net.readNet(net_file)
     edge_offsets = {}
     current_offset = 0.0
-    for edge_id in mainline_edges:
-        edge = net.getEdge(edge_id)
-        edge_offsets[edge_id] = current_offset
-        current_offset += edge.getLength()
+    mainline_set = set(mainline_edges) # For faster lookup
+    
+    # 1. Map the Mainline Backbone in order
+    for eid in mainline_edges:
+        try:
+            edge = net.getEdge(eid)
+            edge_offsets[eid] = current_offset
+            current_offset += edge.getLength()
+        except:
+            continue 
+    
+    # 2. BETTER Internal Edge Mapping (The Recursive Stripe Killer)
+    for edge in net.getEdges():
+        eid = edge.getID()
+        if eid.startswith(':'):
+            # We look ahead until we find a "Real" edge that is in our mainline
+            search_queue = [edge]
+            found = False
+            visited = set()
+            
+            while search_queue and not found:
+                curr = search_queue.pop(0)
+                if curr.getID() in visited: continue
+                visited.add(curr.getID())
+                
+                for out in curr.getOutgoing():
+                    out_id = out.getID()
+                    if out_id in edge_offsets: # Found a mainline edge!
+                        edge_offsets[eid] = edge_offsets[out_id]
+                        found = True
+                        break
+                    elif out_id.startswith(':'): # Keep digging through the junction
+                        search_queue.append(out)
+    
     
     total_mainline_length = current_offset
+    print(edge_offsets)
     
-    # 2. Parse FCD File
+    # 2. Parse FCD File (Iterative for performance)
     data = []
-    max_sim_time = 0
     context = ET.iterparse(fcd_xml, events=('start', 'end'))
+    current_time = 0
+    start_time = None
     
     for event, elem in context:
         if event == 'start' and elem.tag == 'timestep':
+            if start_time is None:
+                start_time = float(elem.get('time'))
+            else:
+                start_time = min(start_time, float(elem.get('time')))
             current_time = float(elem.get('time'))
-            if current_time > max_sim_time:
-                max_sim_time = current_time
         
         if event == 'end' and elem.tag == 'vehicle':
             lane_id = elem.get('lane')
+            # Handle internal edges if necessary, but here we focus on mainline
             edge_id = lane_id.rsplit('_', 1)[0]
+
+            if edge_id not in edge_offsets:
+                #print(f"Dropped edge: {edge_id}") # Uncomment to see the 'black holes'
+                pass
             
             if edge_id in edge_offsets:
                 abs_pos = edge_offsets[edge_id] + float(elem.get('pos'))
@@ -511,30 +556,223 @@ def parse_fcd_to_timespace(fcd_xml, net_file, mainline_edges, sim_time, segment_
     df['space_bin'] = (df['abs_pos'] // segment_length).astype(int)
     df['time_bin'] = (df['time'] // time_step * time_step).astype(int)
 
-    # 4. Aggregate
-    speed_matrix = df.groupby(['space_bin', 'time_bin'])['speed'].mean().unstack()
-    volume_matrix = df.groupby(['space_bin', 'time_bin'])['veh_id'].nunique().unstack() * (3600 / time_step)
+    # 4. Pivot instead of GroupBy (more robust for matrix formation)
+    speed_matrix = df.pivot_table(index='space_bin', columns='time_bin', values='speed', aggfunc='mean')
+    volume_matrix = df.pivot_table(index='space_bin', columns='time_bin', values='veh_id', aggfunc='nunique')
+    
+    # Normalize Volume to Hourly Flow
+    volume_matrix = volume_matrix * (3600 / time_step)
 
-    # 5. REINDEXING: Fill the gaps
-    # Define full range of bins
+    # 5. REINDEXING
     all_space_bins = np.arange(0, int(total_mainline_length // segment_length) + 1)
-    all_time_bins = np.arange(0, int(sim_time // time_step * time_step) + time_step, time_step)
+    all_time_bins = np.arange(start_time, start_time+int(sim_time // time_step * time_step) + time_step, time_step)
 
-    # Apply reindexing to both axes
-    def fill_matrix(mtx):
-        return mtx.reindex(index=all_space_bins, columns=all_time_bins)
+    speed_matrix = speed_matrix.reindex(index=all_space_bins, columns=all_time_bins)
+    volume_matrix = volume_matrix.reindex(index=all_space_bins, columns=all_time_bins).fillna(0)
 
-    speed_matrix = fill_matrix(speed_matrix)
-    volume_matrix = fill_matrix(volume_matrix)
+    # 6. ANTI-STRIPE LOGIC (Spatial Interpolation)
+    # Even without 'impute=True', you need to fill the junction gaps 
+    # so the plot doesn't have white lines.
+    
+    # Fill gaps between edges (horizontal stripes)
+    speed_matrix = speed_matrix.interpolate(method='linear', axis=0, limit_direction='both')
+    
+    # Fill temporal flicker (random missing pixels)
+    speed_matrix = speed_matrix.interpolate(method='linear', axis=1, limit_direction='both')
 
-    # Optional: Fill volume NaNs with 0 (since no vehicles = 0 flow)
-    # Note: We usually keep speed as NaN where no vehicles exist to avoid showing 0 km/h 
-    volume_matrix = volume_matrix.fillna(0)
+    # If you want to force 0 where there's still no data after interpolation:
+    if impute:
+        speed_matrix = speed_matrix.fillna(0)
 
     return speed_matrix, volume_matrix
 
+def parse_detector_as_fcd(fcd_xml, net_file, mainline_edges, sim_time, segment_length=100, time_step=10):
+    # 1. Use your EXISTING FCD parser to get the sparse matrices
+    # This ensures identical shape and logic to your simulation results
+    speed_matrix, volume_matrix = parse_fcd_to_timespace(
+        fcd_xml, net_file, mainline_edges, sim_time, segment_length, time_step
+    )
+
+    # 2. Apply Spatial Imputation
+    # Because the 'fake' FCD only has vehicles at detector locations,
+    # we fill the space between them.
+    speed_imputed = speed_matrix.interpolate(method='linear', axis=0, limit_direction='both')
+    
+    # For flow/volume, we interpolate but usually fill edge cases with 0 
+    # if the road starts/ends far from any detector.
+    volume_imputed = volume_matrix.interpolate(method='linear', axis=0, limit_direction='both')
+
+    return speed_imputed, volume_imputed
+
+
+def generate_detector_mapping(detector_file):
+    """
+    Parses a SUMO detector file and creates a mapping dictionary.
+    Format: { "RDS_Lane": (lane_id, pos) }
+    """
+    tree = ET.parse(detector_file)
+    root = tree.getroot()
+    
+    detector_mapping = {}
+
+    # SUMO detectors are usually <inductionLoop> (E1) or <laneAreaDetector> (E2/E3)
+    # We search for both tags
+    for det_type in ['inductionLoop', 'laneAreaDetector']:
+        for det in root.findall(f'.//{det_type}'):
+            det_id = det.get('id')
+            lane_id = det.get('lane')
+            pos = det.get('pos')
+            
+            # Logic to construct your RDS-style key (e.g., "56_7_0")
+            # This depends on how your lanes are named. 
+            # If your lane_id is "E1_0", we can transform it.
+            # Here we split the lane_id to try and match your naming convention:
+            parts = lane_id.split('_')
+            if len(parts) >= 2:
+                # Example: "E1_0" becomes a key based on your specific RDS naming
+                # Since RDS isn't in the XML, you might need a simple lookup 
+                # or use the lane_id directly as the key.
+                detector_mapping[lane_id] = (lane_id, pos)
+            else:
+                detector_mapping[det_id] = (lane_id, pos)
+
+    return detector_mapping
+
+def parse_detector_to_timespace(df_name, sim_time, total_mainline_length, segment_length=100, time_step=30):
+    detector_mapping = generate_detector_mapping(DETECTOR_FILE) # Adjust path as needed
+    
+    df = pd.read_csv(df_name, delimiter=';')
+    df.columns = df.columns.str.strip()
+    
+    # 1. Normalize IDs and Map to Absolute Position
+    df['clean_id'] = df['Detector'].str.replace(".", "_")
+    df['abs_pos'] = df['clean_id'].map(lambda x: float(detector_mapping[x][1]) if x in detector_mapping else np.nan)
+    df = df.dropna(subset=['abs_pos'])
+
+    # 2. Time Conversion (if timestamp is '00:05:00', convert to seconds)
+    if df['Time'].dtype == object:
+        df['Time'] = pd.to_timedelta(df['Time']).dt.total_seconds()
+
+    # 3. Binning
+    df['space_bin'] = (df['abs_pos'] // segment_length).astype(int)
+    df['time_bin'] = (df['Time'] // time_step * time_step).astype(int)
+
+    # 4. Create Pivots
+    # For Speed: average of the speed column
+    speed_pivot = df.pivot_table(index='space_bin', columns='time_bin', values='vPKW', aggfunc='mean')
+    
+    # For Flow: sum of qPKW (assuming qPKW is vehicles per time step)
+    # Then multiply to get Vehicles per Hour: (count / time_step) * 3600
+    flow_pivot = df.pivot_table(index='space_bin', columns='time_bin', values='qPKW', aggfunc='sum')
+    flow_pivot = flow_pivot * (3600 / time_step)
+
+    # 5. Create the Full Grid
+    max_pos = max([float(v[1]) for v in detector_mapping.values()])
+    all_space_bins = np.arange(0, int(total_mainline_length // segment_length) + 1)
+    all_time_bins = np.arange(0, int(sim_time // time_step * time_step) + time_step, time_step)
+
+    # 5. Reindex
+    # speed_pivot only has rows for the bins where detectors exist.
+    # Reindexing to 'all_space_bins' creates the empty rows for the rest of the road.
+    speed_matrix = speed_pivot.reindex(index=all_space_bins, columns=all_time_bins)
+    flow_matrix = flow_pivot.reindex(index=all_space_bins, columns=all_time_bins)
+
+    # 6. Impute
+    # IMPORTANT: Linear interpolation only fills BETWEEN data points. 
+    # If your first detector is at bin 5 and the road starts at bin 0, 
+    # limit_direction='both' will fill bin 0-4 with the value of bin 5.
+    speed_matrix_imputed = speed_matrix.interpolate(method='linear', axis=0, limit_direction='both')
+    flow_matrix_imputed = flow_matrix.interpolate(method='linear', axis=0, limit_direction='both')
+
+    return speed_matrix_imputed, flow_matrix_imputed
+
+
+def scipy_impute(df):
+    # 1. Get coordinates of the grid
+    # x = segments, y = time
+    x_coords, y_coords = np.meshgrid(np.arange(df.shape[1]), np.arange(df.shape[0]))
+    
+    # 2. Identify where we have data and where we have NaNs
+    mask = ~np.isnan(df.values)
+    points = np.array([x_coords[mask], y_coords[mask]]).T
+    values = df.values[mask]
+    
+    # 3. Interpolate
+    # 'cubic' is smooth but can overshoot; 'linear' is safer for traffic data
+    imputed_values = griddata(points, values, (x_coords, y_coords), method='linear')
+    
+    # 4. Fill edges that griddata might leave as NaN (extrapolation)
+    # Griddata won't extrapolate outside the 'convex hull' of your data
+    result_df = pd.DataFrame(imputed_values, index=df.index, columns=df.columns)
+    return result_df.bfill(axis=1).ffill(axis=1).bfill(axis=0).ffill(axis=0)
+
+def calculate_mape(sim_df, pid_df):
+    # Ensure they have the same shape and labels
+        sim_df, pid_df = pid_df.align(sim_df, join='inner')
+        
+        # Use Pandas operations directly (simpler, handles indices for you)
+        # This avoids the np.full and manual masking headache
+        abs_pct_error = (sim_df - pid_df).abs() / sim_df
+        
+        # Replace infinite values (where pid was 0) and NaNs
+        abs_pct_error = abs_pct_error.replace([np.inf, -np.inf], np.nan)
+        
+        # Calculate the mean of all non-NaN values
+        return abs_pct_error.mean().mean() * 100
+
+def calculate_smape(sim_df, pid_df):
+    # Align and mask
+    sim_df, pid_df = pid_df.align(sim_df, join='inner')
+    mask = sim_df.notna() & pid_df.notna()
+    
+    s = sim_df.values[mask]
+    p = pid_df.values[mask]
+    
+    # Formula: 100 * |sim - pid| / ((|sim| + |pid|) / 2)
+    # Adding a tiny epsilon (1e-5) prevents 0/0 if both are exactly zero
+    numerator = np.abs(s - p)
+    denominator = (np.abs(s) + np.abs(p)) / 2 + 1e-5
+    
+    smape_val = np.mean(numerator / denominator) * 100
+    return smape_val
 
 def main(plot_dir, data_dir):
+    sim_data = True
+    if METHOD_TYPE == "PID":
+        method_log = "pid_log_sim_3hr.csv" if sim_data else "pid_log_rds.csv"
+    elif METHOD_TYPE == "FR":
+        method_log = "fr_log.csv"
+    elif METHOD_TYPE == "OD":
+        method_log = "od_log.csv"
+    
+    if METHOD_TYPE == "PID":
+        method_fcd_file_name = "fcd_output/fcd_pid_sim_3hr.xml"
+    elif METHOD_TYPE == "FR":
+        method_fcd_file_name = "fcd_output/fcd_fr_sim_3hr.xml"
+    elif METHOD_TYPE == "OD":
+        method_fcd_file_name = "fcd_output/fcd_od_sim_3hr.xml"
+    gt_fcd = 'fcd_output/fcd_sim.xml' if sim_data else 'fcd_output/rds_fcd.xml'
+
+    files_to_move = [method_fcd_file_name, method_log, gt_fcd]
+    
+    for file_path in files_to_move:
+        # Construct full source and destination paths
+        source = os.path.join(data_dir, file_path)
+        destination = os.path.join(plot_dir, file_path)
+        
+        # Ensure the destination subdirectory exists (e.g., 'fcd_output/')
+        dest_subdir = os.path.dirname(destination)
+        if not os.path.exists(dest_subdir):
+            os.makedirs(dest_subdir)
+            
+        # Move the file
+        if os.path.exists(source):
+            shutil.copy2(source, destination)
+            print(f"Moved: {file_path}")
+        else:
+            print(f"Warning: {source} not found.")
+
+    show_flow = True
     if not os.path.exists(plot_dir):
         os.makedirs(plot_dir)
 
@@ -552,99 +790,107 @@ def main(plot_dir, data_dir):
 
     header_pid = ['step', 'time', 'sensors', 'target', 'observed', 'smoothed_error', 'raw_control_signal', 'delayed_signal', 'new_total_injection']
     header_debug = ['step', 'time', 'sensors', 'target', 'observed']
+    header_fr = ['step', 'time', 'sensors', 'target', 'observed', 'speed']
+    header_od = ['step', 'time', 'sensors', 'target', 'observed', 'speed']
+    if METHOD_TYPE == "PID":
+        header_method = header_pid
+    elif METHOD_TYPE == "FR":
+        header_method = header_fr
+    elif METHOD_TYPE == "OD":
+        header_method = header_od
+
+
+    sim_time = 1800
+    create_interactive_plot(os.path.join(data_dir, method_log), header_method, plot_dir+"sensor_")
     
-    create_interactive_plot(os.path.join(data_dir, "pid_log.csv"), header_pid, plot_dir+"sensor_")
-    if os.path.exists(os.path.join(data_dir, "debug_log.csv")):
-        create_interactive_plot(os.path.join(data_dir, "debug_log.csv"), header_debug, plot_dir+"debug_")
-    else:
-        print(f"File not found: {os.path.join(data_dir, 'debug_log.csv')}, skipping analysis")
-   
-    plot_stacked_3x2(plot_dir, os.path.join(data_dir, 'route_proportions.csv'))
     '''
     generate_multi_file_heatmap(plot_dir, lane_shapes, lane_to_det, "150m_transfer")
     '''
     # Time space plot absolute position calculation
-    NET_FILE = os.path.join(data_dir, 'i24.net.xml')
-    DET_FILE = os.path.join(data_dir, 'i24_RDS_gt.add.xml')
+    NET_FILE = os.path.join(data_dir, 'i24b.net.xml')
     # Define your mainline order here
     MAINLINE = data["mainlane"]
 
     ## parameters for plotting time space plot
     segment_length = 100
-    time_bucket = 10 # seconds
+    if sim_data:
+        time_bucket = 10 # seconds
+        speed_df_sim, flow_df_sim = parse_fcd_to_timespace(os.path.join(data_dir, 'fcd_output/fcd_sim.xml'), NET_FILE, MAINLINE, sim_time, 
+                                            segment_length=segment_length, time_step=time_bucket)
+    else:
+        time_bucket = 30 # seconds
+        speed_df_sim, flow_df_sim = parse_detector_as_fcd(os.path.join(data_dir, 'fcd_output/rds_fcd.xml'), NET_FILE, MAINLINE, sim_time, 
+                                            segment_length=segment_length, time_step=time_bucket)
+        
+    speed_df_pid, flow_df_pid = parse_fcd_to_timespace(os.path.join(data_dir, method_fcd_file_name), NET_FILE, MAINLINE, sim_time, 
+                                           segment_length=segment_length, time_step=time_bucket,impute=False)
+    # Impute along the 'segment' axis (axis=1) or 'time' axis (axis=0)
+    #speed_df_pid = scipy_impute(speed_df_pid)
+    #flow_df_pid = scipy_impute(flow_df_pid)
 
-    speed_df_sim, flow_df_sim = parse_fcd_to_timespace(os.path.join(data_dir, 'fcd_output/fcd_sim.xml'), NET_FILE, MAINLINE, num_timesteps, 
-                                           segment_length=segment_length, time_step=time_bucket)
-    speed_df_pid, flow_df_pid = parse_fcd_to_timespace(os.path.join(data_dir, 'fcd_output/fcd_pid.xml'), NET_FILE, MAINLINE, num_timesteps, 
-                                           segment_length=segment_length, time_step=time_bucket)
+    #speed_df_sim = scipy_impute(speed_df_sim)
+    #flow_df_sim = scipy_impute(flow_df_sim)
     
     # 1. Define the mask (using .values to ensure we are working with coordinates)
-    valid_mask = (flow_df_pid != 0).values & flow_df_pid.notna().values & flow_df_sim.notna().values
-
-    # 2. Initialize error array with NaNs
-    error = np.full(flow_df_sim.shape, np.nan)
-
-    # 3. Calculate the percentage error for valid indices only
-    # We flatten the result to 1D to match the boolean indexing requirements
-    numerator = (flow_df_sim.values[valid_mask] - flow_df_pid.values[valid_mask])
-    denominator = flow_df_pid.values[valid_mask]
-
-    error[valid_mask] = np.abs(numerator / denominator)
-
-    # 4. Calculate MAPE
-    mape = np.nanmean(error) * 100
-    print(f"Mean Absolute Percentage Error (MAPE) between Simulation and PID Flow: {mape:.2f}%")
     
+
+    speed_mape = calculate_mape(speed_df_sim, speed_df_pid)
+    flow_mape = calculate_mape(flow_df_sim, flow_df_pid) if show_flow else None
+
+    speed_smape = calculate_smape(speed_df_sim, speed_df_pid)
+    flow_smape = calculate_smape(flow_df_sim, flow_df_pid) if show_flow else None
+
+    # --- 2. Setup Plotting Grid ---
+    # Choose 2 columns if show_flow is True, else 1 column
+    ncols = 2 if show_flow else 1
+    fig, axes = plt.subplots(2, ncols, figsize=(8*ncols, 10), sharex=True, sharey=True, layout='constrained')
+    
+    # Handle axes indexing if it's only 1 column (matplotlib flattens the array)
+    if not show_flow:
+        axes = np.expand_dims(axes, axis=1)
+
+    # --- 3. Speed Plotting Parameters ---
     speed_min = min(speed_df_sim.min().min(), speed_df_pid.min().min())
     speed_max = max(speed_df_sim.max().max(), speed_df_pid.max().max())
-
-    # 2. Calculate global min/max for Flow
-    flow_min = min(flow_df_sim.min().min(), flow_df_pid.min().min())
-    flow_max = max(flow_df_sim.max().max(), flow_df_pid.max().max())
-
-    lane_count_series = get_lane_count_grid(NET_FILE, MAINLINE, segment_length=segment_length)
-
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10), sharex=True, sharey=True, layout='constrained')
     
-    # Define plotting parameters to keep it clean
-    plot_params = {
+    speed_params = {
         'cmap': 'RdYlGn', 
         'vmin': speed_min, 
         'vmax': speed_max, 
         'cbar_kws': {'label': 'Speed (m/s)'}
     }
 
-    flow_params = {
-        'cmap': 'viridis', 
-        'vmin': flow_min, 
-        'vmax': flow_max, 
-        'cbar_kws': {'label': 'Flow (veh/h)'}
-    }
-
-    # --- TOP ROW: Simulation ---
-    mape_str = f" (MAPE: {mape:.2f}%)"
-    sns.heatmap(speed_df_sim.iloc[::-1], ax=axes[0, 0], **plot_params)
-    axes[0, 0].set_title('Simulation: Speed')
+    # --- 4. Render Speed (Column 0) ---
+    sns.heatmap(speed_df_sim.iloc[::-1], ax=axes[0, 0], **speed_params)
+    axes[0, 0].set_title(f'Simulation: Speed\n(Speed MAPE: {speed_mape:.2f}%, SMAPE: {speed_smape:.2f}%)')
     
-    sns.heatmap(flow_df_sim.iloc[::-1], ax=axes[0, 1], **flow_params)
-    axes[0, 1].set_title('Simulation: Flow')
-
-    # --- BOTTOM ROW: PID ---
-    sns.heatmap(speed_df_pid.iloc[::-1], ax=axes[1, 0], **plot_params)
+    sns.heatmap(speed_df_pid.iloc[::-1], ax=axes[1, 0], **speed_params)
     axes[1, 0].set_title('PID Control: Speed')
-    
-    sns.heatmap(flow_df_pid.iloc[::-1], ax=axes[1, 1], **flow_params)
-    axes[1, 1].set_title('PID Control: Flow')
 
-    plt.suptitle(mape_str, fontsize=16, fontweight='bold')
+    # --- 5. Render Flow (Column 1) - Optional ---
+    if show_flow:
+        flow_min = min(flow_df_sim.min().min(), flow_df_pid.min().min())
+        flow_max = max(flow_df_sim.max().max(), flow_df_pid.max().max())
+        
+        flow_params = {
+            'cmap': 'viridis', 
+            'vmin': flow_min, 
+            'vmax': flow_max, 
+            'cbar_kws': {'label': 'Flow (veh/h)'}
+        }
 
-    # Formatting Labels
+        sns.heatmap(flow_df_sim.iloc[::-1], ax=axes[0, 1], **flow_params)
+        axes[0, 1].set_title(f'Simulation: Flow\n(Flow MAPE: {flow_mape:.2f}%, SMAPE: {flow_smape:.2f}%)')
+        
+        sns.heatmap(flow_df_pid.iloc[::-1], ax=axes[1, 1], **flow_params)
+        axes[1, 1].set_title('PID Control: Flow')
+
+    # --- 6. Formatting ---
     for ax in axes[1, :]:
         ax.set_xlabel('Time Step')
     for ax in axes[:, 0]:
         ax.set_ylabel('Road Segment')
 
-    #plt.tight_layout()
     plt.savefig(plot_dir + 'time_space_plots.png', dpi=300)
     plt.show()
 

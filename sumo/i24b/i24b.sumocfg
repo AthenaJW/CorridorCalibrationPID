@@ -19,9 +19,17 @@
     </output> -->
 
     <time>
-        <step-length value="0.5"/>
-        <begin value="0"/>       <!-- Start time of the simulation (0 seconds) -->
-        <end value="600"/>       <!-- End time of the simulation (600 seconds) -->
+        <step-length value="0.1"/>
+        <begin value="0"/>       
+        <end value="1800"/>     
     </time>
+
+    <processing>
+        <xml-validation value="never"/>
+    </processing>
+
+    <gui_only>
+		<start value="t"/>
+	</gui_only>
 
 </configuration>

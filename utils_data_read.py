@@ -586,12 +586,58 @@ def filter_trajectory_data(input_file, output_file, start_time, end_time):
 
 #     return
 
+def extract_rds_measurements(rds_file, det_locations, interval_seconds=30):
+    # 1. Read the data
+    # Note: If the file uses commas for decimals (European RDS), add decimal=','
+    df = pd.read_csv(rds_file, delimiter=';')
+    
+    # 2. Map detectors (Same logic as yours, just cleaner)
+    detector_split = df['Detector'].str.split('_', expand=True)
+    mile_parts = detector_split[0].str.split('.', expand=True)
+    df['Detector_Mapped'] = mile_parts[0] + "_" + mile_parts[1] + "_" + detector_split[1]
+
+    # 3. Apply the Physics Scaling
+    # Speed: If raw vPKW is km/h (common in RDS), 0.621 converts to mph
+    # Volume: qPKW * (3600 / 30) = qPKW * 120 (converts count to veh/hr)
+    speed_scale = 0.621371 
+    volume_scale = 3600 / interval_seconds 
+
+    detector_data = {"speed": [], "volume": [], "occupancy": []}
+
+    for detector_id in det_locations:
+        # Filter for this specific detector
+        mask = df['Detector_Mapped'] == detector_id
+        filtered = df[mask].copy()
+
+        # Vectorized calculations (Fast)
+        speeds = filtered['vPKW'].values * speed_scale
+        volumes = filtered['qPKW'].values * volume_scale
+        
+        # Occupancy estimate: (Volume / Speed) * constant 
+        # (This avoids the row-by-row interval.get loop)
+        occupancies = np.where(speeds > 0, volumes / speeds, 0)
+
+        detector_data["speed"].append(speeds)
+        detector_data["volume"].append(volumes)
+        detector_data["occupancy"].append(occupancies)
+    
+    # 4. Final conversion to Numpy Arrays
+    for key in detector_data:
+        detector_data[key] = np.array(detector_data[key])
+    
+    detector_data["flow"] = detector_data["volume"]
+    # Density = Flow / Speed (in veh/mile per lane)
+    detector_data["density"] = np.where(detector_data["speed"] > 0, 
+                                        detector_data["flow"] / detector_data["speed"], 0)
+    
+    return detector_data
+
 
 if __name__ == "__main__":
 
-    file_path = r'PATH TO RDS.dat.gz'
-    write_file_path = r'data/RDS/I24_WB_52_60_11132023.csv'
-    # read_and_filter_file(file_path, write_file_path, 52, 57.5)
+    file_path = r'R3_TSS-11132023--1.dat'
+    write_file_path = r'data/RDS/I24_WB_58_62_11132023.csv'
+    read_and_filter_file(file_path, write_file_path, 58.7, 62.9)
     # 
     # vis_rds_color(write_file_path=write_file_path, lane_number=None)
     # plot_ramp_volumes(write_file_path)
