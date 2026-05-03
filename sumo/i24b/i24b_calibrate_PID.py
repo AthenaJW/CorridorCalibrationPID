@@ -60,6 +60,7 @@ initial_guess = {key: DEFAULT_PARAMS[key] for key in param_names if key in DEFAU
 num_timesteps = config["i24"]["SIMULATION_TIME"]
 step_length = config["i24"]["STEP_LENGTH"]
 detector_interval = config["i24"]["DETECTOR_INTERVAL"]
+rds_file =  "data/RDS/detections_0360-0600.csv"
 
 def extract_detector_locations(csv_file, direction="westbound"):
     """
@@ -172,6 +173,7 @@ def run_PID_closed_loop_sumo(sim_config, controlled_flow_routes, sensing_detecto
                              ma_windows=None, num_lanes=None, # New argument: List of seconds for MA
                              route_tracking_sensors=None, routes=None, pid_flows=None,
                              detectors_to_routes=None,
+                             pid_sensor_log="pid_log_sim_3hr.csv",
                              tripinfo_output=None, fcd_output=None):
     
     command = [SUMO_EXE, '-c', sim_config, '--no-step-log', '--xml-validation', 'never', '--lateral-resolution', '0.5']
@@ -201,7 +203,7 @@ def run_PID_closed_loop_sumo(sim_config, controlled_flow_routes, sensing_detecto
         ma_steps = max(1, int(ma_windows[i] // detector_interval))
         sensing_history_buffers.append(deque(maxlen=ma_steps))
 
-    pid_sensor_log = "pid_log_sim_3hr.csv"
+   
     header_pid = ['step', 'time', 'sensors', 'target', 'observed', 'smoothed_error', 'raw_control_signal', 'delayed_signal', 'new_total_injection']
     header_tracking = ['step', 'time', 'sensor_id', 'total_count'] + [f'route_{i}_prop' for i in range(len(controlled_flow_routes))]
     header_debug = ['step', 'time', 'sensors', 'target', 'observed']
@@ -877,7 +879,7 @@ def save_sim_to_rds_csv(detector_data, measurement_locations, output_filename="s
             if det_id not in mapping:
                 continue
 
-            print(f"Processing detector {det_id} at time {current_time_str} i {i})")
+            #print(f"Processing detector {det_id} at time {current_time_str} i {i})")
             
             metadata = mapping[det_id]
             
@@ -905,74 +907,83 @@ def save_sim_to_rds_csv(detector_data, measurement_locations, output_filename="s
     print(f"Fixed 24h file saved. Total intervals: {intervals}")
     print(f"Time range: {df_out['timestamp'].iloc[0]} to {df_out['timestamp'].iloc[-1]}")
 
-def generate_fcd(csv_file, fcd_file="fcd_output/rds_fcd.xml"):
+def extract_detector_mapping(network_xml_file):
+    """
+    Parses a network or detector XML file to build a mapping dictionary.
+    Format: {"detector_id": ("lane_id", "position")}
+    """
+    detector_mapping = {}
+    
+    try:
+        # Load and parse the XML
+        tree = ET.parse(network_xml_file)
+        root = tree.getroot()
+        
+        # We look for inductionLoop, e1Detector, or detector tags
+        # Depending on your file, you can add more tag types here
+        detector_tags = root.findall('.//inductionLoop') + \
+                        root.findall('.//e1Detector') + \
+                        root.findall('.//detector')
+
+        for det in detector_tags:
+            det_id = det.get('id')
+            lane_id = det.get('lane')
+            # Extract position and convert to string (dropping decimals if needed)
+            pos = str(int(float(det.get('pos', 0)))) 
+            
+            if det_id and lane_id:
+                detector_mapping[det_id] = (lane_id, pos)
+                
+        return detector_mapping
+
+    except FileNotFoundError:
+        print(f"Error: File {network_xml_file} not found.")
+        return {}
+    except ET.ParseError:
+        print(f"Error: Failed to parse XML. Is it a valid network file?")
+        return {}
+
+def generate_fcd(csv_file, fcd_file="fcd_output/rds_fcd.xml", start_window=None, end_window=None):
     csv_data = pd.read_csv(csv_file, delimiter=';')
 
+    # --- NEW: Filter by time window (before normalization) ---
+    # Assuming start_window and end_window are in the same units as the CSV 'Time' column
+    if start_window is not None:
+        csv_data = csv_data[csv_data['Time'] >= start_window]
+    if end_window is not None:
+        csv_data = csv_data[csv_data['Time'] <= end_window]
+
+    # Convert to seconds
     csv_data['Time'] = csv_data['Time'] * 60
     
-    # 2. Normalize to start at 0
-    start_time = csv_data['Time'].min()
-    csv_data['Time'] = csv_data['Time'] - start_time
+    # Normalize to start at 0 (relative to your chosen start window)
+    if not csv_data.empty:
+        start_time = csv_data['Time'].min()
+        csv_data['Time'] = csv_data['Time'] - start_time
+    else:
+        print("Warning: No data found in the specified time window.")
+        return
 
-    print(csv_data.head())
+    print(f"Processing {len(csv_data)} rows. First timestep: {csv_data['Time'].min()}")
 
-    
-    # detector to lane mapping based on SUMO configuration
-    detector_mapping = {
-        # 56.7 RDS: 5 lanes
-        "56_7_0": ("E1_5", "20"),
-        "56_7_1": ("E1_4", "20"),
-        "56_7_2": ("E1_3", "20"),
-        "56_7_3": ("E1_2", "20"),
-        "56_7_4": ("E1_1", "20"),
-
-        # 56.3 RDS: 5 lanes
-        "56_3_0": ("E3_4", "846"),
-        "56_3_1": ("E3_3", "846"),
-        "56_3_2": ("E3_2", "846"),
-        "56_3_3": ("E3_1", "846"),
-        "56_3_4": ("E3_0", "846"),
-
-        # 56.0 RDS: 5 lanes
-        "56_0_0": ("E3_4", "1329"),
-        "56_0_1": ("E3_3", "1329"),
-        "56_0_2": ("E3_2", "1329"),
-        "56_0_3": ("E3_1", "1329"),
-        "56_0_4": ("E3_0", "1329"),
-
-        # 55.3 RDS: 4 lanes
-        "55_3_0": ("E8_3", "130"),
-        "55_3_1": ("E8_2", "130"),
-        "55_3_2": ("E8_1", "130"),
-        "55_3_3": ("E8_0", "130"),
-
-        # 54.6 RDS: 4 lanes
-        "54_6_0": ("E8_3", "1080"),
-        "54_6_1": ("E8_2", "1080"),
-        "54_6_2": ("E8_1", "1080"),
-        "54_6_3": ("E8_0", "1080"),
-    }
-    # Create the root element
+    # ... rest of your code (extract mapping, root element, etc.) ...
+    detector_mapping = extract_detector_mapping('12-15_detectors_gt.xml')
     root = ET.Element("fcd-export")
 
-    # Group by Time (Timesteps)
     for time, group in csv_data.groupby('Time'):
         timestep = ET.SubElement(root, "timestep", time=str(time))
-        
         for _, row in group.iterrows():
-            # Normalize ID: Change '54.6_0' to '54_6_0' to match the dictionary
             csv_id = str(row['Detector']).replace(".", "_")
-            
             if csv_id in detector_mapping:
                 lane_id, position = detector_mapping[csv_id]
                 speed_ms = round(row['vPKW'] / 3.6, 2)
                 
                 if speed_ms > 0:
                     ET.SubElement(timestep, "vehicle", {
-                        "id": str(row['Detector']), # Keep original ID for the car
+                        "id": str(row['Detector']),
                         "lane": lane_id,
                         "speed": str(speed_ms),
-                        "pos": position,  # Now uses the real pos from your XML (e.g., 1080)
+                        "pos": position,
                         "type": "PKW"
                     })
 
@@ -1166,7 +1177,6 @@ if __name__ == "__main__":
     REAL_DATA = False
     method = "FLOWROUTER" # or "FLOWROUTER" "OD_ESTIMATION"
 
-    rds_file = "rds_file/mediumnet_0300-0480.csv" # only used if REAL_DATA = True
     # ================ Configure the logging module ====================
     current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     log_dir = '_log'
@@ -1180,12 +1190,13 @@ if __name__ == "__main__":
 
     # ================================= run ground truth and generate synthetic measurements
     if REAL_DATA:
-        measured_output = reader.extract_rds_measurements(rds_file, measurement_locations)
+        measured_output = reader.extract_rds_measurements(rds_file, measurement_locations, start_min=360, end_min=390)
+        print("measured_output:", measured_output)
         if method == "FLOWROUTER":
             save_sim_to_rds_fr(measured_output, measurement_locations, output_filename="fr_intermediate.csv", interval_seconds=30)
         save_sim_to_rds_csv(measured_output, measurement_locations, output_filename="simulated_rds_data.csv")
-        generate_fcd(rds_file)
-        pid_flows = od_estimation_large('simulated_rds_data.csv', plot=True, write_rou_xml=True)
+        generate_fcd(rds_file, fcd_file="fcd_output/rds_fcd.xml", start_window=360, end_window=390)
+        pid_flows = od_estimation_large("simulated_rds_data.csv", plot=True, write_rou_xml=True)
     else:
         if RERUN_GT:
             run_sumo(SCENARIO+'_gt.sumocfg', tripinfo_output="tripinfo_gt.xml", fcd_output="fcd_output/fcd_sim.xml")
@@ -1228,8 +1239,8 @@ if __name__ == "__main__":
     print(sensing_detectors)
     
     num_lanes = [1, 1, 1, 1,
-                       1, 1, 1, 1, 1,
-                       1, 1, 1, 4]
+                1, 1, 1, 1, 1,
+                1, 1, 1, 4]
     
     
 
@@ -1269,6 +1280,7 @@ if __name__ == "__main__":
     #delays = [0] * len(controlled_flows_route)
     ## to do: add a configuration checking function here
     if method == "PID":
+        log = "pid_log_sim_3hr.csv" if not REAL_DATA else "pid_log_rds.csv"
         run_PID_closed_loop_sumo(
             sim_config=SCENARIO + ".sumocfg", 
             controlled_flow_routes=controlled_flows_route, 
@@ -1290,7 +1302,8 @@ if __name__ == "__main__":
             route_tracking_sensors=measurement_locations,
             routes=controlled_flows_route,
             pid_flows=pid_flows,
-            detectors_to_routes=detectors_to_routes)
+            detectors_to_routes=detectors_to_routes,
+            pid_sensor_log=log)
     elif method == "FLOWROUTER":
         run_sumo_flowrouter(SCENARIO + "_fr.sumocfg", 
             tripinfo_output=None, 

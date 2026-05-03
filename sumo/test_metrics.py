@@ -2,7 +2,7 @@ import pytest
 import pandas as pd
 import numpy as np
 # Import your functions from your main script
-from utils_vis_PID import calculate_mape, calculate_smape 
+from utils_vis_PID import calculate_mape, calculate_smape, calculate_mae, calculate_rmse, calculate_nmape_shifted
 
 @pytest.fixture
 def test_speed_mape_with_traffic_jam():
@@ -90,15 +90,51 @@ def test_mape_nan_exclusion():
     error = calculate_mape(sim, pid, eps=1.0)
     assert error == pytest.approx(90.909, rel=1e-3)
 
-def test_metrics_empty_intersection():
-    """Tests behavior when no overlapping valid data exists."""
-    # No indices where both have non-NaN values
+def test_mae_basic():
+    """Checks simple mean absolute difference."""
+    sim = pd.DataFrame([[10.0, 20.0]])
+    pid = pd.DataFrame([[15.0, 25.0]])
+    # (|10-15| + |20-25|) / 2 = 5.0
+    assert calculate_mae(sim, pid) == 5.0
+
+def test_mae_with_nans():
+    """Ensures MAE ignores misaligned NaNs."""
     sim = pd.DataFrame([[10.0, np.nan]])
-    pid = pd.DataFrame([[np.nan, 10.0]])
+    pid = pd.DataFrame([[15.0, 100.0]])
+    # Only compares (10, 15) -> 5.0
+    assert calculate_mae(sim, pid) == 5.0
+
+# --- RMSE Tests ---
+def test_rmse_outlier_sensitivity():
+    """RMSE should be higher than MAE when one large error exists."""
+    sim = pd.DataFrame([[10.0, 10.0]])
+    pid = pd.DataFrame([[10.0, 20.0]]) 
+    # Error vector: [0, 10]. Mean Sq: (0^2 + 10^2)/2 = 50. Sqrt(50) approx 7.07
+    mae = calculate_mae(sim, pid)  # 5.0
+    rmse = calculate_rmse(sim, pid) # 7.07
+    assert rmse > mae
+    assert rmse == pytest.approx(7.071, rel=1e-3)
+
+# --- NMAPE (Shifted/Normalized) Tests ---
+def test_nmape_zero_handling():
+    """Tests the logic: |0-20| / (0+1) = 20 (2000%) vs |0-20| / (0+0.01) = 2000 (200,000%)"""
+    sim = pd.DataFrame([[0.0]])
+    pid = pd.DataFrame([[20.0]])
     
-    mape_err = calculate_mape(sim, pid)
-    smape_err = calculate_smape(sim, pid)
+    # Coworker version (Shifted by 1.0)
+    nmape_val = calculate_nmape_shifted(sim, pid, shift=1.0)
+    # Standard MAPE with your chosen eps=0.01
+    mape_val = calculate_mape(sim, pid, eps=0.01)
     
-    # np.mean([]) returns np.nan, which is a correct way to signal 'no data'
-    assert np.isnan(mape_err)
-    assert np.isnan(smape_err)
+    assert nmape_val == 2000.0   # Much more 'readable'
+    assert mape_val == 200000.0  # Mathematically raw, but huge
+
+# --- Edge Case: Empty Intersection ---
+def test_all_metrics_empty():
+    sim = pd.DataFrame([[np.nan]])
+    pid = pd.DataFrame([[10.0]])
+    assert np.isnan(calculate_mae(sim, pid))
+    assert np.isnan(calculate_rmse(sim, pid))
+    assert np.isnan(calculate_nmape_shifted(sim, pid))
+    assert np.isnan(calculate_mape(sim, pid, eps=1.0))
+    assert np.isnan(calculate_smape(sim, pid))

@@ -338,8 +338,8 @@ def run_PID_closed_loop_sumo(sim_config, controlled_flow_routes, sensing_detecto
                     try:
                         route_proportions[1] = pid_flows['r_1'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx])
                         route_proportions[2] = pid_flows['r_2'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx])
-                        route_proportions[3] = pid_flows['r_3'][target_idx] / (pid_flows['r_3'][target_idx] + pid_flows['r_4'][target_idx])
-                        route_proportions[4] = pid_flows['r_4'][target_idx] / (pid_flows['r_3'][target_idx] +pid_flows['r_4'][target_idx])
+                        #route_proportions[3] = pid_flows['r_3'][target_idx] / (pid_flows['r_3'][target_idx] + pid_flows['r_4'][target_idx])
+                        #route_proportions[4] = pid_flows['r_4'][target_idx] / (pid_flows['r_3'][target_idx] +pid_flows['r_4'][target_idx])
                     except:
                         route_proportions[1] = 0.5
                         route_proportions[2] = 0.5
@@ -370,8 +370,8 @@ def run_PID_closed_loop_sumo(sim_config, controlled_flow_routes, sensing_detecto
                     try:
                         route_proportions[1] = pid_flows['r_1'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx])
                         route_proportions[2] = pid_flows['r_2'][target_idx] / (pid_flows['r_1'][target_idx] + pid_flows['r_2'][target_idx])
-                        route_proportions[3] = pid_flows['r_3'][target_idx] / (pid_flows['r_3'][target_idx] + pid_flows['r_4'][target_idx])
-                        route_proportions[4] = pid_flows['r_4'][target_idx] / (pid_flows['r_3'][target_idx] +pid_flows['r_4'][target_idx])
+                        #route_proportions[3] = pid_flows['r_3'][target_idx] / (pid_flows['r_3'][target_idx] + pid_flows['r_4'][target_idx])
+                        #route_proportions[4] = pid_flows['r_4'][target_idx] / (pid_flows['r_3'][target_idx] +pid_flows['r_4'][target_idx])
                     except:
                         route_proportions[1] = 0.5
                         route_proportions[2] = 0.5
@@ -1148,8 +1148,8 @@ if __name__ == "__main__":
     cmd_probs = [float(x) for x in sys.argv[1:]] if len(sys.argv) > 1 else None
     ## SCRIPT CONFIGS ##
     RERUN_GT = False # whether to rerun the ground truth simulation and regenerate synthetic measurements (set to False to save time if already done)
-    REAL_DATA = False
-    method = "OD_ESTIMATION" # or "FLOWROUTER" "OD_ESTIMATION"
+    REAL_DATA = True
+    method = "PID" # or "FLOWROUTER" "OD_ESTIMATION"
 
     rds_file = "rds_file/mediumnet_0300-0480.csv" # only used if REAL_DATA = True
     # ================ Configure the logging module ====================
@@ -1165,7 +1165,7 @@ if __name__ == "__main__":
 
     # ================================= run ground truth and generate synthetic measurements
     if REAL_DATA:
-        measured_output = reader.extract_rds_measurements(rds_file, measurement_locations)
+        measured_output = reader.extract_rds_measurements(rds_file, measurement_locations, map_detectors=True)
         if method == "FLOWROUTER":
             save_sim_to_rds_fr(measured_output, measurement_locations, output_filename="fr_intermediate.csv", interval_seconds=30)
         save_sim_to_rds_csv(measured_output, measurement_locations, output_filename="simulated_rds_data.csv")

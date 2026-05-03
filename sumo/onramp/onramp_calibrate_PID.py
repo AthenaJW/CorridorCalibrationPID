@@ -123,7 +123,7 @@ def run_PID_closed_loop_sumo(sim_config, controlled_flow_routes, sensing_detecto
     if fcd_output is not None:
         command.extend([ '--fcd-output', fcd_output])
     
-    pid_sensor_log = "pid_log.csv"
+    pid_sensor_log = "pid_log_sim_3hr.csv"
     debug_sensor_log = "debug_log.csv"
     header_pid = ['step', 'time', 'sensors', 'target', 'observed', 'error', 'control_output', 'new_flow', 'veh_ids']
     header_debug = ['step', 'time', 'sensors', 'target', 'observed']
@@ -438,10 +438,17 @@ if __name__ == "__main__":
     controlled_flows_route = [("ramp",), ("mainlane",)]
     sensing_detectors = [("merge_1", "merge_2"), ("merge_0", "merge_1")]
     debug_detectors = [("upstream_0", "upstream_1"), ("ramp_0",)]
+    sensing_detectors=[("ramp_0",), ("upstream_0", "upstream_1")]
     pid_controllers = [PID(0.05, 0, 0, setpoint=0.0), PID(0.1, 0, 0, setpoint=0.0)]
     for pid in pid_controllers:
         pid.output_limits = (-1000, 1000)
     ## TODO: add a configuration checking function here
-    run_PID_closed_loop_sumo(sim_config=SCENARIO+".sumocfg", controlled_flow_routes=controlled_flows_route, sensing_detectors=sensing_detectors, debug_detectors=debug_detectors, pid_controllers=pid_controllers, synth_data=synth_data, fcd_output="fcd_output/fcd_pid.xml") #, fcd_output ="trajs_pid.xml")
+    run_PID_closed_loop_sumo(sim_config=SCENARIO+".sumocfg", 
+                             controlled_flow_routes=controlled_flows_route, 
+                             sensing_detectors=sensing_detectors, 
+                             debug_detectors=debug_detectors, 
+                             pid_controllers=pid_controllers, 
+                             synth_data=synth_data, 
+                             fcd_output="fcd_output/fcd_pid_sim_3hr.xml") #, fcd_output ="trajs_pid.xml")
     
 

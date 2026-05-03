@@ -6,9 +6,9 @@
     <route id="ramp" edges="ramp E2 E4" />
 	<route id="mainlane" edges="E0 E1 E2 E4 " />
 
-	<flow id="ramp_0" type="gt" begin="0" end="2000" vehsPerHour="500" route="ramp" departLane="random" departSpeed="desired" />
-    <flow id="mainlane_0" type="gt" begin="0" end="480" vehsPerHour="500" route="mainlane" departLane="random" departSpeed="desired" />
-    <flow id="mainlane_1" type="gt" begin="480" end="960" vehsPerHour="4000" route="mainlane" departLane="random" departSpeed="desired" />
-    <flow id="mainlane_2" type="gt" begin="960" end="2000" vehsPerHour="500" route="mainlane" departLane="random" departSpeed="desired" />
+	<flow id="mainlane_0" type="gt" begin="0" end="2000" vehsPerHour="1000" route="ramp" departLane="random" departSpeed="desired" />
+    <flow id="ramp_0" type="gt" begin="0" end="480" vehsPerHour="100" route="mainlane" departLane="random" departSpeed="desired" />
+    <flow id="ramp_1" type="gt" begin="480" end="960" vehsPerHour="300" route="mainlane" departLane="random" departSpeed="desired" />
+    <flow id="ramp_2" type="gt" begin="960" end="2000" vehsPerHour="500" route="mainlane" departLane="random" departSpeed="desired" />
 
 </routes>

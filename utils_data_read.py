@@ -586,47 +586,64 @@ def filter_trajectory_data(input_file, output_file, start_time, end_time):
 
 #     return
 
-def extract_rds_measurements(rds_file, det_locations, interval_seconds=30):
+def extract_rds_measurements(rds_file, det_locations, start_min=None, end_min=None, interval_seconds=30, map_detectors=None):
     # 1. Read the data
-    # Note: If the file uses commas for decimals (European RDS), add decimal=','
     df = pd.read_csv(rds_file, delimiter=';')
     
-    # 2. Map detectors (Same logic as yours, just cleaner)
-    detector_split = df['Detector'].str.split('_', expand=True)
-    mile_parts = detector_split[0].str.split('.', expand=True)
-    df['Detector_Mapped'] = mile_parts[0] + "_" + mile_parts[1] + "_" + detector_split[1]
+    # 2. Map detectors 
+    if map_detectors:
+        detector_split = df['Detector'].str.split('_', expand=True)
+        mile_parts = detector_split[0].str.split('.', expand=True)
+        df['Detector_Mapped'] = mile_parts[0] + "_" + mile_parts[1] + "_" + detector_split[1]
+    else:
+        df['Detector_Mapped'] = df['Detector']
 
-    # 3. Apply the Physics Scaling
-    # Speed: If raw vPKW is km/h (common in RDS), 0.621 converts to mph
-    # Volume: qPKW * (3600 / 30) = qPKW * 120 (converts count to veh/hr)
+    # 3. Numeric Time Filtering
+    # Assuming your time column is called 'Time_Min' (adjust to your actual column name)
+    if start_min is not None and end_min is not None:
+        df = df[(df['Time'] >= start_min) & (df['Time'] <= end_min)]
+        
+        # Determine the expected sequence of time steps to keep arrays aligned
+        # (e.g., 360.0, 360.5, 361.0...)
+        step = interval_seconds / 60.0
+        expected_times = np.arange(start_min, end_min + step, step)
+    else:
+        expected_times = sorted(df['Time'].unique())
+
+    # 4. Apply Scaling
     speed_scale = 0.621371 
     volume_scale = 3600 / interval_seconds 
 
     detector_data = {"speed": [], "volume": [], "occupancy": []}
 
-    for detector_id in det_locations:
-        # Filter for this specific detector
-        mask = df['Detector_Mapped'] == detector_id
-        filtered = df[mask].copy()
+    # Optimization: Pivot the table so Time is the index and Detectors are columns
+    # This automatically aligns all detectors to the same time grid
+    pivot_v = df.pivot(index='Time', columns='Detector_Mapped', values='vPKW').reindex(expected_times)
+    pivot_q = df.pivot(index='Time', columns='Detector_Mapped', values='qPKW').reindex(expected_times)
 
-        # Vectorized calculations (Fast)
-        speeds = filtered['vPKW'].values * speed_scale
-        volumes = filtered['qPKW'].values * volume_scale
+    for detector_id in det_locations:
+        # Pull the column for this detector; if missing, it will be NaNs
+        v_raw = pivot_v[detector_id].values if detector_id in pivot_v.columns else np.full(len(expected_times), np.nan)
+        q_raw = pivot_q[detector_id].values if detector_id in pivot_q.columns else np.full(len(expected_times), 0)
+
+        speeds = v_raw * speed_scale
+        volumes = q_raw * volume_scale
         
-        # Occupancy estimate: (Volume / Speed) * constant 
-        # (This avoids the row-by-row interval.get loop)
+        # Fill NaNs with 0 for calculation, but you can keep them as NaNs if you prefer
+        speeds = np.nan_to_num(speeds)
+        volumes = np.nan_to_num(volumes)
+        
         occupancies = np.where(speeds > 0, volumes / speeds, 0)
 
         detector_data["speed"].append(speeds)
         detector_data["volume"].append(volumes)
         detector_data["occupancy"].append(occupancies)
     
-    # 4. Final conversion to Numpy Arrays
-    for key in detector_data:
+    # 5. Final conversion to Numpy Arrays (Shape: [Num_Detectors, Num_Time_Steps])
+    for key in ["speed", "volume", "occupancy"]:
         detector_data[key] = np.array(detector_data[key])
     
     detector_data["flow"] = detector_data["volume"]
-    # Density = Flow / Speed (in veh/mile per lane)
     detector_data["density"] = np.where(detector_data["speed"] > 0, 
                                         detector_data["flow"] / detector_data["speed"], 0)
     

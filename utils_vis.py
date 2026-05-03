@@ -1369,12 +1369,13 @@ def od_estimation(rds_file, plot=False, write_rou_xml=False):
     #TR = y1/(y1+y2)
     total_flow = y1 + y2
     TR = np.where(total_flow > 0, y1 / total_flow, 0.0)
+    eps = 1
     # TR = 0.1038
-    f13 = TR * y4
-    f15 = (1-TR) * y4
-    f45 = y3 - y2
-    f25 = y3 - f15 - f45
-    f23 = y1 - f13
+    f13 = TR * y4 + eps
+    f15 = (1-TR) * y4 + eps
+    f45 = y3 - y2 + eps
+    f25 = y3 - f15 - f45 + eps
+    f23 = y1 - f13 + eps
 
     data = {
         'r_1': f13, 'r_0': f15, 'r_4': f45, 'r_3': f25, 'r_2': f23
@@ -1445,7 +1446,7 @@ def od_estimation(rds_file, plot=False, write_rou_xml=False):
                     "departLane": "best",
                     "route": r,
                     "end": f"{(i-start+1) * 30}",
-                    "vehsPerHour": f"{f[i]}",
+                    "vehsPerHour": f"{f[i]+1}",
                     "departSpeed": "desired"
                 }
                 idx += 1
