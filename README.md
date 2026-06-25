@@ -76,59 +76,123 @@ File output naming convention (this will be in the appropriate method directory,
 
 **od_log.csv** - log of observed vehicle count versus actual at controlled sensors from od estimation method
 
-Following this naming convention, should you also want to compare genetic algorithm, or any other method on the i24b benchmark, add your fcd file to fcd_output in the appropriate directory.
+Following this naming convention, should you also want to compare genetic algorithm, or any other method on the i24b benchmark, add your fcd file to fcd_output in the appropriate directory. You will also need to write a method to turn an out.xml file, or whatever seems most useful, into the similar csv files as above.
 
 ## **Plotting Files**
 
 /sumo/utils_vis_PID.py is the primary file responsible for generating time space .npy files, that can be further visualized however the user likes.
 
-### Dependencies  
-This package is built on Python 3.11, and requires installation of [optuna](https://optuna.org/), and [sumo](https://sumo.dlr.de/docs/Installing/index.html)
+You must ctrl-f for "SCENARIO =" and replace the field for the scenario you are using. Then in config.json, in the part of the file that has the metadata for the scenario, change the field "METHOD_TYPE:" to the method you are using. Example: I set the scenario to be "SCENARIO = i24" and want to use the OD estimatioin method configure the config.json file like this:
 
-## **Relevant Directories**  
+```
+...
+"i24":{
+        "SIMULATION_TIME": 10800,
+        "N_ROUTES": 5,
+        "N_INTERVALS": 12,
+        "RDS_DIR": "REPLACE_WITH_YOUR_LOCAL_RDS_PATH",
+        "STEP_LENGTH": 0.1,
+        "DETECTOR_INTERVAL": 30,
+        "DETECTOR_FILE": "i24_RDS_gt.add.xml",
+        "METHOD_TYPE": "OD",
+        "NET_FILE": "i24.net.xml",
+        "IS_RDS": false
+    }
+...
+```
+The possible flags are "PID", "OD", "FR", "GA".
 
 
+## **Command-Line Arguments**
 
-### 3. Running calibration  
-To run the calibration of any scenario, navigate to the SCENARIO folder and run `SCENARIO_calibrate.py`. For example, to run the `i24b` scenario:
-```bash  
-cd sumo/i24b
-python i24b_calibrate.py
-```  
-The calibration progress such as current best parameters will be saved in `sumo/i24/_log`.
+The simulation script accepts command-line flags to customize file paths and output locations. If no arguments are provided, it defaults to the `onramp` scenario directories.
 
-### 4. Evaluation and plotting (TODO: i24b in progress)
-All evaluation related computations are located in `sumo/SCENARIO/SCENARIO_results.py`. Current evaluation & visualization support:
-1. Calibrated vs. measured speed at the locations of stationary sensors
-![detector speeds](det_b.png)
-2. Macroscopic quantities (speed, flow, density)
-![macroscopic quantities](asm_5hr.png)
-3. Lane-specific travel time
-![travel time](travel_time_rds.png)
+### **Available Options**
 
-### Key utility functions
-In summary,
-- `utils_data_read.py` contains functions to read and process RDS and .xml data
-- `utils_vis.py` contains all visualization functions
-- `utils_macro.py` contains Edie's method to compute macroscopic traffic quantities from trajectory data
+| Flag | Type | Default Value | Description |
+| --- | --- | --- | --- |
+| `--plot_dir` | `str` | `"onramp/figures/temp/"` | The directory where generated evaluation and PID control plots will be saved. |
+| `--data_dir` | `str` | `"onramp/data/"` | The directory where the required simulation data and network files are located. |
 
-The detailed descriptions of these methods are documented inline. To highlight a few:
-- `utils_data_read.parse_and_reorder_xml()` takes the SUMO floating car data (fcd) output `.xml` file, reorders by trajectory and time into NGSIM data format.
-- `utils_macro.compute_macro_generalized()` implements the generalized Edie's method, and processes trajectory data into macroscopic quantities for the specified spatial and temporal window.
-- `utils_macro.plot_macro()` plots the macroscopic quantities of flow, density and speed computed using `macro.compute_macro_generalized()`.
-- `utils_vis.visualize_fcd()` plots the time-space diagram given the fcd file.
-- `utils_vis.plot_line_detectors()` plot the aggregated traffic data generated from SUMO at the specified detector locations.
+### **Usage Examples**
 
-### Using calibrated SUMO
-If you only want to work with the calibrated SUMO scenarios without the calibration, you are in good hands!
-All calibrated scenarios are located in `sumo/SCENARIO/calibrated`, which contains all the necessary files to run SUMO. You can run `SCENARIO.sumocfg` directly using SUMO-gui, or using command line 
+**Run with defaults:**
+
 ```bash
-cd sumo/SCENARIO/calibrated
-sumo -c SCENARIO.sumocfg
+uv run python utils_vis_PID.py
+
 ```
 
-### TODOS
-- temp files handling in i24 and onramp scenarios
-- add calibrated results for i24b scenario (i24b_results.py and plotting)
-- calibrate only westbound?
----
+**Customizing output directories:**
+
+```bash
+uv run python utils_vis_PID.py --plot_dir "sumo/i24b/figures/scenario1_fr/" --data_dir "sumo/i24b/"
+
+```
+
+To make it easier for the user, I have made it so that all files used for plotting are copied into the relevant directory for reuse. If the directory is already there, it will just use those files again. If you want to write over those files however, but use the same file name, set the flag "rerun_sim = true"
+
+
+In the main control flow block, you can run the main method, or the generate_master_stacked_plot method (see below):
+
+```
+if __name__ == "__main__":
+
+    # 1. Initialize the parser
+    parser = argparse.ArgumentParser(description="Run on-ramp simulation and save plots.")
+
+    # 2. Add the argument as a keyword (using the -- flag)
+    parser.add_argument(
+        "--plot_dir", 
+        type=str, 
+        default="onramp/figures/temp/",
+        help="Directory where figures will be saved"
+    )
+
+    parser.add_argument(
+        "--data_dir", 
+        type=str, 
+        default="onramp/data/",
+        help="Directory where data files are located"
+    )
+
+    # 3. Parse the arguments
+    args = parser.parse_args()
+
+    # 4. Access the value using args.plot_dir
+    if not os.path.exists(args.plot_dir):
+        os.makedirs(args.plot_dir)
+        print(f"Created new directory: {args.plot_dir}")
+
+
+    main(plot_dir=args.plot_dir, data_dir=args.data_dir)
+    #generate_master_stacked_plot(base_dir = args.data_dir, is_rds=False)
+```
+
+The main method generates the npy file for that particular method and scenario and puts it in your figure directory. If you were to put all the npy files from this process in one directory and give them appropriate unique names like the following (this is an example from this repository)
+
+CorridorCalibrationPID/sumo/plot_data/large/scenario1/
+- fr/
+---flow_pid.npy
+---flow_sim.npy
+---speed_pid.npy
+---speed_sim.npy
+- od/
+---flow_pid.npy
+---flow_sim.npy
+---speed_pid.npy
+---speed_sim.npy
+- pid/
+---flow_pid.npy
+---flow_sim.npy
+---speed_pid.npy
+---speed_sim.npy
+
+The generate_master_stacked_plot method will take in the directory where the "fr", "ga", and "pid" folders are held bia the --data_dir flag (in this case: CorridorCalibrationPID/sumo/plot_data/large/scenario1) and generate the stacked plots on top of each other.
+
+You control the methods that are plotted using this field: "methods = ["pid", "fr", "od"]", where the strings must match the folder names. That field also determines the name of each section of the plot, but in uppercase (example below, GT stands for ground truth)
+
+![alt text](image.png)
+
+
+

@@ -27,7 +27,6 @@ from utils_data_read import rds_to_matrix_i24b
 # import utils_macro as macro
 # import utils_vis as vis
 
-# ================ on-ramp scenario setup ====================
 SCENARIO = "onramp"
 EXP = "1b"
 N_TRIALS = 10000
