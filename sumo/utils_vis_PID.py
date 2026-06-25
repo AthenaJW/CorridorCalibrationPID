@@ -418,6 +418,16 @@ def generate_comparison_tracking_plot(base_dir, header_cols):
 def create_interactive_plot(data, header_cols, output_fig_dir):
     df = pd.read_csv(data, index_col=False)
 
+    plt.rcParams.update({
+        'font.size': 18,          # Base for everything
+        'axes.titlesize': 30,     # Subplot titles
+        'axes.labelsize': 30,     # X and Y axis labels
+        'xtick.labelsize': 30,    # Tick numbers
+        'ytick.labelsize': 30,    # Tick numbers
+        'legend.fontsize': 24,    # Legend text
+        'figure.titlesize': 30    # Main figure title
+    })
+
     # Force column names to match exactly what you expect
     df.columns = header_cols
 
@@ -478,16 +488,26 @@ def create_interactive_plot(data, header_cols, output_fig_dir):
         # --- 2. MATPLOTLIB (Static Subplots for Reports/LaTeX) ---
         fig_mtl, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True, 
                                           gridspec_kw={'height_ratios': [2, 1]})
+        
 
         # Main Plot
         ax1.plot(s_df['step'], s_df['target'], label='Target', color='#636EFA', marker='o', markersize=3, alpha=0.8)
         ax1.plot(s_df['step'], s_df['observed'], label='Observed', color='#EF553B', marker='o', markersize=3, alpha=0.8)
+        mae_val = s_df['error'].abs().mean()
+        bias_val = s_df['error'].mean()
+        metrics_label = f"MAE: {mae_val:.2f} | Bias: {bias_val:.2f}"
         ax1.set_ylabel('Flow (Vehicles / hour)')
-        ax1.set_title(f'Target vs Observed Flow: {sensor_name}', fontsize=12)
-        ax1.legend(loc='upper right')
+        ax1.set_title(metrics_label, fontsize=40, pad=20)
+        ax1.legend(loc='upper left')
         ax1.grid(True, linestyle='--', alpha=0.6)
 
         # Error Plot (Residuals)
+        max_step = 18000
+        ticks = np.arange(0, max_step + 1, 5000)
+
+        # Apply to the axis
+        ax2.set_xticks(ticks)
+        ax2.set_xticklabels([f'{int(val)//10}' for val in ticks])
         ax2.plot(s_df['step'], s_df['error'], color='black', linewidth=1, alpha=0.5)
         # Green fill for over-prediction, Red for under-prediction
         ax2.fill_between(s_df['step'], s_df['error'], 0, where=(s_df['error'] >= 0), 
@@ -495,15 +515,26 @@ def create_interactive_plot(data, header_cols, output_fig_dir):
         ax2.fill_between(s_df['step'], s_df['error'], 0, where=(s_df['error'] < 0), 
                          color='red', alpha=0.2, label='Under-predict')
         
+        max_err_val = ((s_df['error'].abs().max() * 1.1 )//100) * 100
+        
+        # 2. Set the Y-limits symmetrically
+        ax2.set_ylim(-max_err_val, max_err_val)
+        
+        # 3. Force the ticks to show -Max, 0, and +Max
+        # Using f'{x:,.0f}' adds a thousands comma for cleaner reporting
+        ax2.set_yticks([-max_err_val, 0, max_err_val])
+        ax2.set_yticklabels([f'{int(-max_err_val)}', '0', f'{int(max_err_val)}'])
+        
         ax2.axhline(0, color='black', linewidth=1.5, zorder=1) # Baseline
         ax2.set_ylabel('Error')
-        ax2.set_xlabel('Simulation Step')
+        ax2.set_xlabel('Time (s)')
         ax2.grid(True, linestyle=':', alpha=0.5)
 
         plt.tight_layout()
         
         # Save figure
         file_path = f"{output_fig_dir}analysis_{sensor_name}.png"
+        fig_mtl.align_ylabels([ax1, ax2])
         plt.savefig(file_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"Saved analysis plot for {sensor_name}")
@@ -850,14 +881,101 @@ def calculate_nmape_shifted(sim_df, pid_df, shift=1.0):
     
     return np.mean(normalized_pct_error) * 100
 
+def process_fcd(input_file, output_file, start_time, end_time):
+    # Parse the XML file
+    tree = ET.parse(input_file)
+    root = tree.getroot()
+    
+    # Track which nodes to keep
+    new_root = ET.Element("fcd-export")
+    
+    for timestep in root.findall('timestep'):
+        current_time = float(timestep.get('time'))
+        
+        # 1. Trim: Check if time is within the desired window
+        if start_time <= current_time <= end_time:
+            
+            # 2. Shift: Calculate the new time (relative to 0)
+            new_time = round(current_time - start_time, 2)
+            timestep.set('time', str(new_time))
+            
+            # Add the modified timestep to our new root
+            new_root.append(timestep)
+
+    # Save the new XML
+    new_tree = ET.ElementTree(new_root)
+    with open(output_file, "wb") as f:
+        new_tree.write(f, encoding="utf-8", xml_declaration=True)
+
+
+
+def parse_and_aggregate(file_path, data_dir, routes, start_offset):
+    """Parses SUMO .out file and aggregates flow by detector tuples."""
+    tree = ET.parse(file_path)
+    root = tree.getroot()
+    
+    # Flatten routes to a lookup map: {'det_id': 'tuple_string'}
+    detector_map = {det: str(route) for route in routes for det in route}
+    
+    data = []
+    for interval in root.findall('interval'):
+        begin = float(interval.get('begin'))
+        det_id = interval.get('id')
+        
+        # Filter by time window and relevant detectors
+        if start_offset <= begin <= (start_offset + 1800) and det_id in detector_map:
+            data.append({
+                'step': (begin - start_offset+30) * 10,
+                'time': begin - start_offset+30,
+                'sensors': detector_map[det_id],
+                'target': int(interval.get('nVehContrib')) 
+            })
+            
+    df = pd.DataFrame(data)
+    df.to_csv("ga_log1.csv")
+
+    df_source = pd.read_csv(data_dir + 'df_source.csv')
+
+    # 2. Convert ONLY the 'time' and 'target' columns to numeric
+    # Do NOT convert the 'sensors' column
+    df_source['time'] = pd.to_numeric(df_source['time'], errors='coerce')
+    df_source['target'] = pd.to_numeric(df_source['target'], errors='coerce')
+
+    # 3. Ensure sensors are strings (to avoid comparison errors)
+    df_source['sensors'] = df_source['sensors'].astype(str).str.strip()
+    df['sensors'] = df['sensors'].astype(str).str.strip()
+
+    # 4. Group and Map
+    obs_lookup = df_source.groupby(['time', 'sensors'])['target'].sum()
+
+    def get_obs(row):
+        try:
+            # Use the multi-index lookup
+            count = obs_lookup.loc[(float(row['time']), str(row['sensors']))]
+            return float(count) * 120
+        except (KeyError, TypeError):
+            return 0.0
+
+    # Apply the logic
+    df['target_flow'] = df['target'].astype(float) * 120
+    df['observed_flow'] = df.apply(get_obs, axis=1)
+
+    # 5. Save final result
+    df[['time', 'sensors', 'target_flow', 'observed_flow']].to_csv(data_dir + "ga_log.csv", index=False)
+
 def main(plot_dir, data_dir):
     rerun_sim = False
+
+
+
     if METHOD_TYPE == "PID":
         method_log = "pid_log_sim_3hr.csv" #  if sim_data else "pid_log_rds.csv"
     elif METHOD_TYPE == "FR":
         method_log = "fr_log.csv"
     elif METHOD_TYPE == "OD":
         method_log = "od_log.csv"
+    elif METHOD_TYPE == "GA":
+        method_log = "ga_log.csv"
     
     if METHOD_TYPE == "PID":
         method_fcd_file_name = "fcd_output/fcd_pid_sim_3hr.xml"
@@ -865,6 +983,12 @@ def main(plot_dir, data_dir):
         method_fcd_file_name = "fcd_output/fcd_fr_sim_3hr.xml"
     elif METHOD_TYPE == "OD":
         method_fcd_file_name = "fcd_output/fcd_od_sim_3hr.xml"
+    elif METHOD_TYPE == "GA":
+        #process_fcd(data_dir + "fcd_output/fcd_ga.xml", data_dir + "fcd_output/fcd_ga_sim_3hr.xml", 21600, 23400)
+        #parse_and_aggregate(data_dir + "fcd_output/ga_out.xml", data_dir, detectors_to_routes, START_TIME)
+
+        method_fcd_file_name = "fcd_output/fcd_ga_sim_3hr.xml"
+        
     gt_fcd = 'fcd_output/fcd_sim.xml' if not IS_RDS else 'fcd_output/rds_fcd.xml'
 
     files_to_move = [method_fcd_file_name, method_log, gt_fcd]
@@ -921,6 +1045,8 @@ def main(plot_dir, data_dir):
         header_method = header_fr
     elif METHOD_TYPE == "OD":
         header_method = header_od
+    else:
+        header_method = header_pid
 
 
     sim_time = 1800
@@ -935,30 +1061,42 @@ def main(plot_dir, data_dir):
 
     ## parameters for plotting time space plot
     segment_length = 100
-    if not IS_RDS:
-        time_bucket = 10 # seconds
-        speed_df_sim, flow_df_sim = parse_fcd_to_timespace(os.path.join(data_dir, 'fcd_output/fcd_sim.xml'), NET_FILE, MAINLINE, sim_time, 
-                                            segment_length=segment_length, time_step=time_bucket)
-    else:
-        time_bucket = 30 # seconds
-        speed_df_sim, flow_df_sim = parse_detector_as_fcd(os.path.join(data_dir, 'fcd_output/rds_fcd.xml'), NET_FILE, MAINLINE, sim_time, 
-                                            segment_length=segment_length, time_step=time_bucket)
-        
-    speed_df_pid, flow_df_pid = parse_fcd_to_timespace(os.path.join(data_dir, method_fcd_file_name), NET_FILE, MAINLINE, sim_time, 
-                                           segment_length=segment_length, time_step=time_bucket,impute=False)
-    
-    data_to_save = {
-        "speed_sim": speed_df_sim,
-        "flow_sim": flow_df_sim,
-        "speed_pid": speed_df_pid,
-        "flow_pid": flow_df_pid
-    }
+    npy_files = ["speed_sim.npy", "flow_sim.npy", "speed_pid.npy", "flow_pid.npy"]
+    # Check if all files exist in the plot_dir
+    all_files_exist = all(os.path.exists(os.path.join(plot_dir, f)) for f in npy_files)
 
-    for name, df in data_to_save.items():
-        # Convert to numpy and save
-        file_path = os.path.join(plot_dir, f"{name}.npy")
-        np.save(file_path, df.to_numpy())
-        print(f"Saved {name} to {file_path}")
+    if all_files_exist and not rerun_sim:
+        print("Pre-calculated .npy files found. Loading from disk...")
+        speed_df_sim = pd.DataFrame(np.load(os.path.join(plot_dir, "speed_sim.npy")))
+        flow_df_sim = pd.DataFrame(np.load(os.path.join(plot_dir, "flow_sim.npy")))
+        speed_df_pid = pd.DataFrame(np.load(os.path.join(plot_dir, "speed_pid.npy")))
+        flow_df_pid = pd.DataFrame(np.load(os.path.join(plot_dir, "flow_pid.npy")))
+    else:
+        print("Files missing or incomplete. Calculating time-space matrices...")
+        if not IS_RDS:
+            time_bucket = 10 # seconds
+            speed_df_sim, flow_df_sim = parse_fcd_to_timespace(os.path.join(data_dir, 'fcd_output/fcd_sim.xml'), NET_FILE, MAINLINE, sim_time, 
+                                                segment_length=segment_length, time_step=time_bucket)
+        else:
+            time_bucket = 30 # seconds
+            speed_df_sim, flow_df_sim = parse_detector_as_fcd(os.path.join(data_dir, 'fcd_output/rds_fcd.xml'), NET_FILE, MAINLINE, sim_time, 
+                                                segment_length=segment_length, time_step=time_bucket)
+            
+        speed_df_pid, flow_df_pid = parse_fcd_to_timespace(os.path.join(data_dir, method_fcd_file_name), NET_FILE, MAINLINE, sim_time, 
+                                            segment_length=segment_length, time_step=time_bucket, impute=False)
+        
+        data_to_save = {
+            "speed_sim": speed_df_sim.to_numpy() if isinstance(speed_df_sim, pd.DataFrame) else speed_df_sim,
+            "flow_sim": flow_df_sim.to_numpy() if isinstance(flow_df_sim, pd.DataFrame) else flow_df_sim,
+            "speed_pid": speed_df_pid.to_numpy() if isinstance(speed_df_pid, pd.DataFrame) else speed_df_pid,
+            "flow_pid": flow_df_pid.to_numpy() if isinstance(flow_df_pid, pd.DataFrame) else flow_df_pid
+        }
+
+        # Save the newly calculated data
+        for name, arr in data_to_save.items():
+            file_path = os.path.join(plot_dir, f"{name}.npy")
+            np.save(file_path, arr)
+            print(f"Saved {name} to {file_path}")
 
     
     # Impute along the 'segment' axis (axis=1) or 'time' axis (axis=0)
@@ -990,65 +1128,92 @@ def main(plot_dir, data_dir):
 
     # --- 2. Setup Plotting Grid ---
     # Choose 2 columns if show_flow is True, else 1 column
+    total_seconds = 180
+    step = 30
+    STABLE_MIN = 0.0
+    STABLE_MAX = 50.0
+    flow_min = min(flow_df_sim.min().min(), flow_df_pid.min().min())
+    flow_max = max(flow_df_sim.max().max(), flow_df_pid.max().max())
+
+    # Create a normalization object for Flow (just like you did for Speed)
+    flow_norm = mcolors.Normalize(vmin=flow_min, vmax=flow_max)
+    norm = mcolors.Normalize(vmin=STABLE_MIN, vmax=STABLE_MAX)
+    # Create the positions (where the ticks go) and labels (what they say)
+    # Note: This assumes your dataframe columns represent seconds. 
+    # If 1 column = 1 second, the index is just the time.
+    tick_positions = np.arange(0, total_seconds + 1, step)
+    tick_labels = [str(sec*10) for sec in tick_positions]
+
+    # --- 2. Setup Figure ---
     ncols = 2 if show_flow else 1
-    fig, axes = plt.subplots(2, ncols, figsize=(8*ncols, 10), sharex=True, sharey=True, layout='constrained')
+    # We use 'width_ratios' to leave a tiny bit of room for the vertical colorbars
+    fig, axes = plt.subplots(2, ncols, figsize=(13*ncols, 7), 
+                            sharex=True, sharey=True, layout='constrained')
     
-    # Handle axes indexing if it's only 1 column (matplotlib flattens the array)
+    plt.rcParams.update({
+        'font.family': 'sans-serif',    # e.g., 'serif', 'sans-serif', 'monospace'
+        'font.sans-serif': ['Arial'],  # Specific font name
+        'font.size': 12,                # Default text size
+        'axes.titlesize': 16,           # Title size
+        'axes.labelsize': 14,           # X and Y label size
+        'xtick.labelsize': 10,          # X-axis tick label size
+        'ytick.labelsize': 10,          # Y-axis tick label size
+        'legend.fontsize': 18,          # Legend size
+    })
+
     if not show_flow:
         axes = np.expand_dims(axes, axis=1)
 
-    # --- 3. Speed Plotting Parameters ---
-    STABLE_MIN = 0.0
-    STABLE_MAX = 30.0
-
-    norm = mcolors.Normalize(vmin=STABLE_MIN, vmax=STABLE_MAX)
-
-    # 3. Calculate your dynamic limit for the bar's length
-    current_data_max = speed_df_sim.max().max() 
-
+    # --- 3. Speed Plotting ---
+    # Remove 'cbar_kws' from speed_params and add cbar=False
     speed_params = {
         'cmap': 'RdYlGn',
-        'norm': norm,           # This fixes the color mapping
-        'vmin': None,           # norm overrides vmin/vmax, so set to None
-        'vmax': None,
-        'cbar_kws': {
-            'label': 'Speed (m/s)',
-            'ticks': [0, 10, 20, 30, 40, 50] # You can fix the labels too
-        }
+        'norm': norm,
+        'cbar': False  # Disable individual cbars
     }
 
-    # --- 4. Render Speed (Column 0) ---
-    sns.heatmap(speed_df_sim.iloc[::-1], ax=axes[0, 0], **speed_params)
-    #axes[0, 0].set_title(f'Simulation: Speed\n(Speed MAPE: {speed_mape:.2f}%, SMAPE: {speed_smape:.2f}%, NMAPE: {speed_nmape_shifted:.2f}%\n, MAE: {speed_mae:.2f}, RMSE: {speed_rmse:.2f})')
-    axes[0, 0].set_title(f'Simulation: Speed')
- 
-    sns.heatmap(speed_df_pid.iloc[::-1], ax=axes[1, 0], **speed_params)
-    axes[1, 0].set_title(f'{METHOD_TYPE} Control: Speed')
+    # Plot Speed Heatmaps
+    im_speed_top = sns.heatmap(speed_df_sim.iloc[::-1], ax=axes[0, 0], **speed_params)
+    im_speed_bot = sns.heatmap(speed_df_pid.iloc[::-1], ax=axes[1, 0], **speed_params)
 
-    # --- 5. Render Flow (Colimn 1) - Optional ---
+    # Create Shared Colorbar for Speed (Column 0)
+    # We use the 'mappable' from one of the heatmaps
+    mappable_speed = im_speed_top.get_children()[0]
+    cbar_speed = plt.colorbar(mappable_speed, ax=axes[:, 0], label='Speed (m/s)',shrink=0.8)
+    cbar_speed.ax.tick_params(labelsize=18)
+
+    # --- 4. Flow Plotting (Optional) ---
     if show_flow:
-        flow_min = min(flow_df_sim.min().min(), flow_df_pid.min().min())
-        flow_max = max(flow_df_sim.max().max(), flow_df_pid.max().max())
-        
         flow_params = {
             'cmap': 'viridis', 
             'vmin': flow_min, 
             'vmax': flow_max, 
-            'cbar_kws': {'label': 'Flow (veh/h)'}
+            'cbar': False
         }
+        im_flow_top = sns.heatmap(flow_df_sim.iloc[::-1], ax=axes[0, 1], **flow_params)
+        im_flow_bot = sns.heatmap(flow_df_pid.iloc[::-1], ax=axes[1, 1], **flow_params)
+        
+        # Create Shared Colorbar for Flow (Column 1)
+        mappable_flow = im_flow_top.get_children()[0]
+        cbar_flow = plt.colorbar(mappable_flow, ax=axes[:, 1], label='Flow (veh/h)', shrink=0.8)
+        cbar_flow.ax.tick_params(labelsize=18)
 
-        sns.heatmap(flow_df_sim.iloc[::-1], ax=axes[0, 1], **flow_params)
-        #axes[0, 1].set_title(f'Similation: Flow\n(Flow MAPE: {flow_mape:.2f}%, SMAPE: {flow_smape:.2f}%, NMAPE: {flow_nmape_shifted:.2f}%\n, MAE: {flow_mae:.2f}, RMSE: {flow_rmse:.2f})')
-        axes[0, 1].set_title(f'Simulation: Flow')
 
-        sns.heatmap(flow_df_pid.iloc[::-1], ax=axes[1, 1], **flow_params)
-        axes[1, 1].set_title('PID Control: Flow')
+    # --- 5. Formatting Ticks ---
+    for ax in axes.flat:
+        # Set the custom X ticks
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels)
+        
+        # Ensure Y labels are horizontal
+        ax.tick_params(axis='y', labelrotation=0)
 
-    # --- 6. Formatting ---
     for ax in axes[1, :]:
-        ax.set_xlabel('Time Step')
+        ax.set_xlabel('Time (seconds)')
     for ax in axes[:, 0]:
-        ax.set_ylabel('Road Segment')
+        ax.set_ylabel('Road Segment', fontsize=22)
+
+    fig.suptitle(f"Speed MAPE: {speed_mape:.2f}%")
 
     plt.savefig(plot_dir + 'time_space_plots.png', dpi=300)
     plt.show()
@@ -1066,9 +1231,15 @@ import seaborn as sns
 import matplotlib.colors as mcolors
 def generate_master_stacked_plot(base_dir, is_rds=False):
     # Set global font sizes
-    plt.rcParams.update({'font.size': 14, 'axes.titlesize': 18, 'axes.labelsize': 16})
+    plt.rcParams.update({
+        'font.size': 20,          # Base font size
+        'axes.labelsize': 30,     # For X and Y axis titles
+        'xtick.labelsize': 24,    # For the numbers on X axis
+        'ytick.labelsize': 24,    # For the numbers on Y axis
+        'font.family': 'sans-serif'
+    })
     
-    methods = ["pid", "fr"]
+    methods = ["pid", "fr", "od"]
     show_flow = not is_rds
     ncols = 2 if show_flow else 1
     nrows = len(methods) + 1 
@@ -1092,7 +1263,7 @@ def generate_master_stacked_plot(base_dir, is_rds=False):
     # We want to show a tick every 300 REAL seconds.
     # We find the array indices that correspond to [0, 300, 600, ...]
     # Formula: index = real_time / interval
-    tick_spacing_seconds = 300
+    tick_spacing_seconds = 1200
     
     # Array indices where we place the ticks
     x_tick_indices = np.arange(0, num_steps, tick_spacing_seconds / time_step_interval)
@@ -1100,7 +1271,7 @@ def generate_master_stacked_plot(base_dir, is_rds=False):
     x_tick_labels = [int(i * time_step_interval) for i in x_tick_indices]
     
     # Y-axis stays consistent with segments
-    y_tick_indices = np.arange(0, num_segments, 5)
+    y_tick_indices = np.arange(0, num_segments, 20)
 
     if show_flow:
         flow_gt = np.load(os.path.join(gt_path, "flow_sim.npy"))
@@ -1126,14 +1297,17 @@ def generate_master_stacked_plot(base_dir, is_rds=False):
             sns.heatmap(data, ax=ax, cmap=cmap, norm=norm, cbar=False)
             
             if i == 0:
-                ax.set_title("SPEED" if col == 0 else "FLOW", fontweight='bold', fontsize=20, pad=10)
+                ax.set_title("SPEED" if col == 0 else "FLOW", fontweight='bold', fontsize=36, pad=10)
             
             ax.invert_yaxis()
 
             # --- Y-Axis Formatting ---
-            ax.set_ylabel(f"{row_title}\nSegments", fontweight='bold', multialignment='center')
+            if i == 1: # assume PID comes first
+                ax.set_ylabel(f"{row_title} (ours) \nSegments", fontweight='bold', multialignment='center', labelpad=10)
+            else:
+                ax.set_ylabel(f"{row_title}\nSegments", fontweight='bold', multialignment='center', labelpad=10)
             ax.set_yticks(y_tick_indices + 0.5)
-            ax.set_yticklabels([str(y) for y in y_tick_indices], rotation=0, va='center', fontsize=12)
+            ax.set_yticklabels([str(y) for y in y_tick_indices], rotation=0, va='center')
 
             # --- X-Axis Formatting (UPDATED FOR RDS) ---
             ax.set_xticks(x_tick_indices + 0.5)
@@ -1147,14 +1321,14 @@ def generate_master_stacked_plot(base_dir, is_rds=False):
     cbar_s = fig.colorbar(sm_s, ax=speed_ax_target, orientation='horizontal', 
                           location='bottom', fraction=0.04, pad=0.05)
     cbar_s.set_label('Speed (m/s)', fontweight='bold', labelpad=5)
-    cbar_s.ax.set_title('Time (seconds)', fontweight='bold', fontsize=16, pad=30)
+    cbar_s.ax.set_title('Time (seconds)', fontweight='bold', pad=30)
 
     if show_flow:
         sm_f = plt.cm.ScalarMappable(norm=mcolors.Normalize(vmin=0, vmax=flow_max), cmap=flow_cmap)
         cbar_f = fig.colorbar(sm_f, ax=axes[:, 1], orientation='horizontal', 
                               location='bottom', fraction=0.04, pad=0.05)
         cbar_f.set_label('Flow (veh/h)', fontweight='bold', labelpad=5)
-        cbar_f.ax.set_title('Time (seconds)', fontweight='bold', fontsize=16, pad=30)
+        cbar_f.ax.set_title('Time (seconds)', fontweight='bold', pad=30)
 
     plt.savefig(os.path.join(base_dir, 'stacked_final_fixed_rotation.png'), bbox_inches='tight')
     plt.show()
@@ -1177,59 +1351,6 @@ def generate_comparison_tracking_plot(base_dir):
 
     plt.rcParams.update({'font.size': 12})
 
-    for col_idx, m_name in enumerate(methods):
-        folder_path = os.path.join(base_dir, m_name)
-        log_files = glob.glob(os.path.join(folder_path, "*_log.csv"))
-        
-        if not log_files:
-            print(f"Skipping {m_name}: No log file found.")
-            continue
-            
-        # Select the correct header for this specific folder
-        current_headers = header_map.get(m_name)
-        
-        # Load data using the specific headers
-        df = pd.read_csv(log_files[0], index_col=False)
-        df.columns = current_headers
-        
-        # Calculate standardized metrics (Observed and Target exist in all)
-        df['error'] = df['observed'] - df['target']
-        mae_val = df['error'].abs().mean()
-        bias_val = df['error'].mean()
-        metrics_label = f"MAE: {mae_val:.2f} | Bias: {bias_val:.2f}"
-
-        # --- ROW 1: Tracking ---
-        ax_top = axes[0, col_idx]
-        ax_top.plot(df['step'], df['target'], label='Target', color='#636EFA', alpha=0.7)
-        ax_top.plot(df['step'], df['observed'], label='Observed', color='#EF553B', alpha=0.7)
-        
-        ax_top.set_title(f"{m_name.upper()}\n{metrics_label}", fontsize=16, fontweight='bold')
-        ax_top.grid(True, linestyle='--', alpha=0.5)
-        
-        if col_idx == 0:
-            ax_top.set_ylabel('Flow (Veh/h)', fontweight='bold')
-        ax_top.legend(loc='upper right')
-
-        # --- ROW 2: Error ---
-        ax_bot = axes[1, col_idx]
-        ax_bot.plot(df['step'], df['error'], color='black', linewidth=1, alpha=0.4)
-        ax_bot.fill_between(df['step'], df['error'], 0, where=(df['error'] >= 0), color='green', alpha=0.2)
-        ax_bot.fill_between(df['step'], df['error'], 0, where=(df['error'] < 0), color='red', alpha=0.2)
-        
-        ax_bot.axhline(0, color='black', linewidth=1.2)
-        ax_bot.grid(True, linestyle=':', alpha=0.5)
-        
-        if col_idx == 0:
-            ax_bot.set_ylabel('Error (Obs - Tar)', fontweight='bold')
-        ax_bot.set_xlabel('Simulation Step', fontweight='bold')
-
-    output_path = os.path.join(base_dir, 'comparison_fixed_headers.png')
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.show()
-    print(f"Master plot saved to: {output_path}")
-
-# Call with the root directory containing the pid, fr, and od folders
-# generate_comparison_tracking_plot('./scenario_1_results')
 
 # Usage
 # generate_horizontal_summary_plots('your_base_dir_here')
@@ -1264,4 +1385,4 @@ if __name__ == "__main__":
 
 
     main(plot_dir=args.plot_dir, data_dir=args.data_dir)
-    #generate_master_stacked_plot(base_dir = args.data_dir, is_rds=True)
+    #generate_master_stacked_plot(base_dir = args.data_dir, is_rds=False)

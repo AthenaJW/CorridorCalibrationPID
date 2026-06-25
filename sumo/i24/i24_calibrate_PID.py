@@ -1148,7 +1148,7 @@ if __name__ == "__main__":
     cmd_probs = [float(x) for x in sys.argv[1:]] if len(sys.argv) > 1 else None
     ## SCRIPT CONFIGS ##
     RERUN_GT = False # whether to rerun the ground truth simulation and regenerate synthetic measurements (set to False to save time if already done)
-    REAL_DATA = True
+    REAL_DATA = False
     method = "PID" # or "FLOWROUTER" "OD_ESTIMATION"
 
     rds_file = "rds_file/mediumnet_0300-0480.csv" # only used if REAL_DATA = True

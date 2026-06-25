@@ -163,7 +163,6 @@ def shift_flow_times(input_file, output_file, shift_amount=1800):
     tree.write(output_file, encoding='utf-8', xml_declaration=True)
     print(f"Successfully shifted times and saved to {output_file}")
 
-
 def main():
     # Convert minutes to seconds for SUMO
     start_time = START_MINUTE * 60

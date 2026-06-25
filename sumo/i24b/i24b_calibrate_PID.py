@@ -1168,13 +1168,52 @@ def save_sim_to_rds_fr(detector_data, measurement_locations, output_filename="fr
     print(f"Time range: {df_out['Time'].iloc[0]} to {df_out['Time'].iloc[-1]}")
 
 
+def save_sim_to_rds(detector_data, measurement_locations, output_filename="fr_intermediate.csv", num_timesteps=1800, interval_seconds=30):
+    """
+    Converts detector_data dict into the specific CSV format required by od_estimation.
+    """
+
+    # Calculate fixed number of intervals for 24 hours
+    # 24 hours * 3600 seconds / interval_seconds
+    intervals = int(num_timesteps / interval_seconds) 
+    
+    num_detectors = detector_data['speed'].shape[0]
+    actual_intervals = detector_data['speed'].shape[1]
+    
+    all_rows = []
+
+    for t in range(intervals):
+        
+        for i in range(num_detectors):
+            det_id = measurement_locations[i]
+            
+            
+            # Use actual data if available, otherwise default to 0
+            if t < actual_intervals:
+                spd = detector_data["speed"][i, t]
+                vol = detector_data["volume"][i, t]
+                occ = detector_data["occupancy"][i, t]
+            else:
+                spd, vol, occ = 0.0, 0.0, 0.0 # Default padding
+            
+            all_rows.append({
+                "Detector": det_id,
+                "Time": t*0.5,
+                "vPKW": spd,
+                "qPKW": (vol / 60) * 0.5,
+            })
+
+    df_out = pd.DataFrame(all_rows)
+        
+    df_out.to_csv(output_filename, sep = ",", index=False)
+
 if __name__ == "__main__":
     measurement_locations = extract_detector_locations("../../data/RDS/detections_0360-0600.csv")
     print(measurement_locations)
     cmd_probs = [float(x) for x in sys.argv[1:]] if len(sys.argv) > 1 else None
     ## SCRIPT CONFIGS ##
     RERUN_GT = False # whether to rerun the ground truth simulation and regenerate synthetic measurements (set to False to save time if already done)
-    REAL_DATA = False
+    REAL_DATA = True
     method = "FLOWROUTER" # or "FLOWROUTER" "OD_ESTIMATION"
 
     # ================ Configure the logging module ====================
@@ -1190,12 +1229,12 @@ if __name__ == "__main__":
 
     # ================================= run ground truth and generate synthetic measurements
     if REAL_DATA:
-        measured_output = reader.extract_rds_measurements(rds_file, measurement_locations, start_min=360, end_min=390)
+        measured_output = reader.extract_rds_measurements(rds_file, measurement_locations, start_min=390, end_min=420)
         print("measured_output:", measured_output)
         if method == "FLOWROUTER":
             save_sim_to_rds_fr(measured_output, measurement_locations, output_filename="fr_intermediate.csv", interval_seconds=30)
         save_sim_to_rds_csv(measured_output, measurement_locations, output_filename="simulated_rds_data.csv")
-        generate_fcd(rds_file, fcd_file="fcd_output/rds_fcd.xml", start_window=360, end_window=390)
+        generate_fcd(rds_file, fcd_file="fcd_output/rds_fcd.xml", start_window=390, end_window=420)
         pid_flows = od_estimation_large("simulated_rds_data.csv", plot=True, write_rou_xml=True)
     else:
         if RERUN_GT:
@@ -1205,6 +1244,8 @@ if __name__ == "__main__":
         if method == "FLOWROUTER":
             save_sim_to_rds_fr(measured_output, measurement_locations, output_filename="fr_intermediate.csv", interval_seconds=30)
         pid_flows = od_estimation_large('simulated_rds_data.csv', plot=True, write_rou_xml=True)
+    
+    save_sim_to_rds(measured_output, measurement_locations, output_filename="scenario4pid.csv", interval_seconds=30)
 
 
     synth_data = measured_output
