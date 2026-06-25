@@ -173,20 +173,20 @@ The main method generates the npy file for that particular method and scenario a
 
 CorridorCalibrationPID/sumo/plot_data/large/scenario1/
 - fr/
----flow_pid.npy
----flow_sim.npy
----speed_pid.npy
----speed_sim.npy
+    - flow_pid.npy
+    - flow_sim.npy
+    - speed_pid.npy
+    - speed_sim.npy
 - od/
----flow_pid.npy
----flow_sim.npy
----speed_pid.npy
----speed_sim.npy
+    - flow_pid.npy
+    - flow_sim.npy
+    - speed_pid.npy
+    - speed_sim.npy
 - pid/
----flow_pid.npy
----flow_sim.npy
----speed_pid.npy
----speed_sim.npy
+    - flow_pid.npy
+    - flow_sim.npy
+    - speed_pid.npy
+    - speed_sim.npy
 
 The generate_master_stacked_plot method will take in the directory where the "fr", "ga", and "pid" folders are held bia the --data_dir flag (in this case: CorridorCalibrationPID/sumo/plot_data/large/scenario1) and generate the stacked plots on top of each other.
 
